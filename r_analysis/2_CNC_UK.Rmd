@@ -1,0 +1,1543 @@
+---
+title: "CNC_UK"
+output: html_document
+---
+
+This document runs the CNC UK analysis for Morgan et al. 2026 - "The City 
+Nature Challenge increases urban biodiversity knowledge and public 
+engagement with blue-green spaces"
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(DHARMa)
+library(lme4)
+library(lmerTest)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(vroom)
+library(stringr)
+```
+
+Import datasets after you have run 1_File_Merge
+```{r import 25 cities for analysis, include=FALSE}
+inat_hull <- read_csv("hull_all.csv")
+inat_birm <- read_csv("birmingham_all.csv")
+inat_liver <- read_csv("liverpool_all.csv")
+inat_brist <- read_csv("bristol_all.csv")
+inat_brig <- read_csv("brighton_all.csv")
+inat_staff <- read_csv("stafford_all.csv")
+inat_chesh <- read_csv("cheshire_all.csv")
+inat_york <- read_csv("york_all.csv")
+inat_northeast <- read_csv("northeast_all.csv")
+inat_london <- read_csv("london_all.csv")
+inat_man <- read_csv("manchester_all.csv")
+inat_lanc <- read_csv("lancashire_all.csv")
+inat_oxf <- read_csv("oxfordshire_all.csv")
+inat_ed <- read_csv("edinburgh_all.csv")
+inat_war_sol <- read_csv("war_sol_all.csv")
+inat_suffolk <- read_csv("suffolk_all.csv")
+inat_belfast <- read_csv("belfast_all.csv")
+inat_berk <- read_csv("berkshire_all.csv")
+inat_swansea <- read_csv("swansea_all.csv")
+inat_dundee <- read_csv("dundee_all.csv")
+inat_gloucest <- read_csv("gloucestershire_all.csv")
+inat_coventry <- read_csv("coventry_all.csv")
+inat_cardnew <- read_csv("cardiff_new_all.csv")
+inat_nott <- read_csv("nott_all.csv")
+inat_glas <- read_csv("glasgow_all.csv")
+inat_urb <- read_csv("urbanness_top25_r.csv")
+```
+
+```{r unique users total}
+# create list
+inat_list <- list(
+  Hull = inat_hull,
+  Birmingham = inat_birm,
+  Liverpool = inat_liver,
+  Bristol = inat_brist,
+  Brighton = inat_brig,
+  Staffordshire = inat_staff,
+  Cheshire = inat_chesh,
+  York = inat_york,
+  NorthEast = inat_northeast,
+  London = inat_london,
+  Manchester = inat_man,
+  Lancashire = inat_lanc,
+  Oxfordshire = inat_oxf,
+  Edinburgh = inat_ed,
+  WarwickandSolihull = inat_war_sol,
+  Suffolk = inat_suffolk,
+  Belfast = inat_belfast,
+  Berkshire = inat_berk,
+  Swansea = inat_swansea,
+  Dundee = inat_dundee,
+  Gloucestershire = inat_gloucest,
+  Coventry = inat_coventry,
+  CardiffNewport = inat_cardnew,
+  Nottingham = inat_nott,
+  Glasgow = inat_glas
+)
+
+# Summary of Users
+user_summary <- map_dfr(
+  inat_list,
+  ~ tibble(
+      unique_users = n_distinct(.x$user_id)
+    ),
+  .id = "city"
+)
+user_stats <- user_summary %>%
+  summarise(
+    total_users = sum(unique_users),
+    mean_users = mean(unique_users),
+    median_users = median(unique_users),
+    max_users = max(unique_users),
+    min_users = min(unique_users)
+  )
+user_stats
+```
+
+```{r record licenses}
+# Create summary by city
+license_summary <- map_dfr(
+  inat_list,
+  ~ tibble(
+      license = .x$license
+    ),
+  .id = "city"
+)
+
+usable_licenses <- c(
+  "CC0", "CC-BY", "CC-BY-NC", 
+  "CC-BY-SA", "CC-BY-ND", 
+  "CC-BY-NC-ND", "CC-BY-NC-SA"
+)
+
+open_licenses <- c("CC0", "CC-BY", "CC-BY-NC")
+
+license_flags <- license_summary %>%
+  mutate(
+    usable = license %in% usable_licenses,
+    open   = license %in% open_licenses
+  )
+
+overall_usable_pct <- license_flags %>%
+  count(usable) %>%
+  mutate(percent = n / sum(n) * 100)
+
+overall_open_pct <- license_flags %>%
+  count(open) %>%
+  mutate(percent = n / sum(n) * 100)
+
+usable_pct_by_city <- license_flags %>%
+  group_by(city, usable) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(percent = n / sum(n) * 100)
+
+open_pct_by_city <- license_flags %>%
+  group_by(city, open) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(percent = n / sum(n) * 100)
+
+license_breakdown <- license_summary %>%
+  count(license) %>%
+  mutate(percent = n / sum(n) * 100)
+
+# Sanity check of one known blank license (authour knows this user has no
+# licences set)
+user_records_hull <- inat_hull %>% dplyr::filter(user_id == 6464285)
+```
+
+```{r process data and run SAC}
+# Data cleaning with function
+process_inat_city <- function(df, city_name) {
+  
+  message("Processing ", city_name, "...")
+  
+  # Filter and clean names (only take species level and remove subspecies name)
+  df_clean <- df %>%
+    # Remove blank or missing licenses
+    filter(!is.na(license) & str_trim(license) != "") %>%
+    filter(quality_grade == "research") %>%
+    mutate(
+      scientific_name = if_else(
+        str_detect(scientific_name, "×"),
+        scientific_name,
+        word(scientific_name, 1, 2)
+      )
+    ) %>%
+    drop_na(scientific_name)
+  
+  ##Diagnostic check 
+  name_words <- str_count(df$scientific_name, "\\S+")
+  more_than_two <- df$scientific_name[name_words > 2]
+  
+  message(" - ", length(unique(more_than_two)),
+          " names had more than two words (subspecies or variants).")
+  if (length(unique(more_than_two)) > 0) {
+    message("   Example (up to 10): ",
+            paste(head(unique(more_than_two), 10), collapse = "; "))
+  }
+  message(" - Retained unique names (simplified): ",
+          length(unique(df_clean$scientific_name)))
+  
+  # Add date/month and year
+  df_clean <- df_clean %>%
+    mutate(
+      date = as.Date(observed_on),
+      month = floor_date(date, "month")
+    ) %>%
+    filter(date >= as.Date("2020-10-01") &
+             date <= as.Date("2025-10-01")) %>%
+    mutate(sep_year = year(date + months(3)))
+  
+  # Compute SAC WITH CNC
+  sac_df <- df_clean %>%
+    arrange(date) %>%
+    group_by(month) %>%
+    summarise(month_species = list(unique(scientific_name)), .groups = "drop") %>%
+    mutate(
+      cum_species = map_dbl(
+        seq_along(month_species),
+        ~ length(unique(unlist(month_species[1:.x])))
+      )
+    )
+  
+  # Remove CNC dates
+  cnc_ranges <- list(
+    "2021" = as.Date(c("2021-04-30", "2021-05-03")),
+    "2022" = as.Date(c("2022-04-29", "2022-05-02")),
+    "2023" = as.Date(c("2023-04-28", "2023-05-01")),
+    "2024" = as.Date(c("2024-04-26", "2024-04-29")),
+    "2025" = as.Date(c("2025-04-25", "2025-04-28"))
+  )
+  
+  df_no_cnc <- df_clean %>%
+    filter(
+      !(date >= cnc_ranges[["2021"]][1] & date <= cnc_ranges[["2021"]][2]) &
+      !(date >= cnc_ranges[["2022"]][1] & date <= cnc_ranges[["2022"]][2]) &
+      !(date >= cnc_ranges[["2023"]][1] & date <= cnc_ranges[["2023"]][2]) &
+      !(date >= cnc_ranges[["2024"]][1] & date <= cnc_ranges[["2024"]][2]) &
+      !(date >= cnc_ranges[["2025"]][1] & date <= cnc_ranges[["2025"]][2])
+    )
+  
+  # SAC without CNC
+  sac_no_cnc <- df_no_cnc %>%
+    arrange(date) %>%
+    group_by(month) %>%
+    summarise(month_species = list(unique(scientific_name)), .groups = "drop") %>%
+    mutate(
+      cum_species = map_dbl(
+        seq_along(month_species),
+        ~ length(unique(unlist(month_species[1:.x])))
+      )
+    )
+  
+  # Merge and calculate difference 
+  merged_df <- merge(sac_df, sac_no_cnc, by = "month", suffixes = c("_with", "_without"))
+  merged_df$diff <- merged_df$cum_species_with - merged_df$cum_species_without
+  
+  # Plot 
+  p <- ggplot(merged_df, aes(x = month)) +
+    geom_ribbon(aes(ymin = cum_species_without, ymax = cum_species_with),
+                fill = "orange", alpha = 0.2) +
+    geom_line(aes(y = cum_species_with), color = "orange", size = 0.8, linetype = "dashed") +
+    geom_line(aes(y = cum_species_without), color = "steelblue", size = 0.8) +
+    labs(
+      x = "Month", y = "Cumulative Species Richness",
+      title = paste("Species Accumulation Curve:", city_name, "– With vs Without CNC")
+    ) +
+    theme_minimal() +
+    scale_x_date(date_labels = "%b-%Y", date_breaks = "3 months")
+  
+  # Final return 
+  return(list(
+    city = city_name,
+    clean_df = df_clean,
+    sac_with = sac_df,
+    sac_without = sac_no_cnc,
+    merged = merged_df,
+    plot = p
+  ))
+}
+
+# code to isolate blank records (Clare Collins)
+user_records_hull <- inat_hull %>% dplyr::filter(user_id == 6464285)
+
+# Datasets
+results_list <- list(
+  Hull = process_inat_city(inat_hull, "Hull"),
+  Birmingham = process_inat_city(inat_birm, "Birmingham"),
+  Liverpool = process_inat_city(inat_liver, "Liverpool"),
+  Bristol = process_inat_city(inat_brist, "Bristol"),
+  Brighton = process_inat_city(inat_brig, "Brighton"),
+  York = process_inat_city(inat_york, "York"),
+  Staffordshire = process_inat_city(inat_staff, "Staffordshire"),
+  Cheshire = process_inat_city(inat_chesh, "Cheshire"),
+  NorthEast = process_inat_city(inat_northeast, "North East"),
+  London = process_inat_city(inat_london, "London"),
+  Manchester = process_inat_city(inat_man, "Manchester"),
+  Lancashire = process_inat_city(inat_lanc, "Lancashire"),
+  Oxford = process_inat_city(inat_oxf, "Oxford"),
+  Edinburgh = process_inat_city(inat_ed, "Edinburgh"),
+  Warwick_and_Solihull = process_inat_city(inat_war_sol, "Warwick and Solihull"),
+  Suffolk = process_inat_city(inat_suffolk, "Suffolk"),
+  Belfast = process_inat_city(inat_belfast, "Belfast"),
+  Berkshire = process_inat_city(inat_berk, "Berkshire"),
+  Swansea = process_inat_city(inat_swansea, "Swansea"),
+  Dundee = process_inat_city(inat_dundee, "Dundee"),
+  Gloucestershire = process_inat_city(inat_gloucest, "Gloucestershire"),
+  Coventry = process_inat_city(inat_coventry, "Coventry"),
+  Cardiff = process_inat_city(inat_cardnew, "Cardiff and Newport"),
+  Nottingham = process_inat_city(inat_nott, "Nottingham"),
+  Glasgow = process_inat_city(inat_glas, "Glasgow")
+)
+
+# Plots
+plots <- map(results_list, "plot")
+results_list$Hull
+results_list$Edinburgh
+results_list$London
+# Extract just the plots
+plots_formatted <- map2(plots, names(plots), ~ .x +
+  labs(title = .y, x = NULL, y = NULL) +   # remove axis titles
+  scale_x_date(date_labels = "%b-%y", date_breaks = "1 year") +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  )
+)
+
+# Combine in a 2x5 grid
+combined_sac <- wrap_plots(plots_formatted, ncol = 5, nrow = 5) +
+  plot_annotation(
+    title = "",
+    subtitle = "Dashed = with CNC, solid = without CNC",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5)
+    )
+  )
+
+# Display
+combined_sac
+
+ggsave(
+  filename = "combined_sac_A4.png",
+  plot = combined_sac,
+  width = 9, 
+  height = 12,
+  units = "in",
+  dpi = 900
+)
+```
+
+```{r Difference Curves}
+datasets <- list(
+  "Hull" = inat_hull,
+  "Birmingham" = inat_birm,
+  "Liverpool" = inat_liver,
+  "Bristol" = inat_brist,
+  "Brighton" = inat_brig,
+  "Staffordshire" = inat_staff,
+  "Cheshire" = inat_chesh,
+  "York" = inat_york,
+  "London" = inat_london,
+  "North East" = inat_northeast,
+  "Manchester" = inat_man,
+  "Lancashire" = inat_lanc,
+  "Oxfordshire" = inat_oxf,
+  "Edinburgh" = inat_ed,
+  "Warwick and Solihull" = inat_war_sol,
+  "Suffolk" = inat_suffolk,
+  "Belfast" = inat_belfast,
+  "Berkshire" = inat_berk,
+  "Swansea" = inat_swansea,
+  "Dundee" = inat_dundee,
+  "Gloucestershire" = inat_gloucest,
+  "Coventry" = inat_coventry,
+  "Cardiff" = inat_cardnew,
+  "Nottingham" = inat_nott,
+  "Glasgow" = inat_glas
+)
+
+# Apply the function to each dataset
+results_list <- imap(datasets, process_inat_city)
+
+# Combine differences into one dataframe
+all_diffs <- map_dfr(results_list, ~ .x$merged %>% 
+                       mutate(city = .x$city) %>% 
+                       select(city, month, diff))
+
+#
+ggplot(all_diffs, aes(x = month, y = diff, color = city)) +
+  geom_line(size = 1.2) +
+  labs(
+    x = "Month", 
+    y = "Difference in Cumulative Species Richness",
+    title = "CNC Impact on Species Accumulation by City",
+    color = "City"
+  ) +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "3 months") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12)
+  )
+```
+
+```{r difference curves avearge}
+library(lubridate)
+
+event_months <- data.frame(
+  month = as.Date(c(
+    "2021-05-01",
+    "2022-05-01",
+    "2023-04-01",
+    "2024-04-01",
+    "2025-04-01"
+  ))
+)
+
+# For each city, find the first month where CNC changes richness
+all_diffs_active <- all_diffs %>%
+  group_by(city) %>%
+  mutate(
+    first_active_month = if (any(diff > 0)) min(month[diff > 0]) else as.Date(NA),
+    started = !is.na(first_active_month) & month >= first_active_month
+  ) %>%
+  ungroup()
+
+# Monthly summary using *only* months after the project is "started"
+monthly_summary <- all_diffs_active %>%
+  group_by(month) %>%
+  summarise(
+    mean_diff = mean(diff, na.rm = TRUE),
+    n_active  = n()
+  ) %>%
+  arrange(month) %>%
+  mutate(mean_diff = mean_diff - first(mean_diff))   # ← baseline fix
+
+
+##
+avg_diff <- ggplot() +
+  # faint individual city lines
+  geom_line(
+    data = all_diffs_active,
+    aes(x = month, y = diff, group = city),
+    colour = "grey80",
+    alpha  = 0.6
+  ) +
+
+  # mean line
+  geom_line(
+    data = monthly_summary,
+    aes(x = month, y = mean_diff),
+    colour   = "black",
+    linewidth = 1.1
+  ) +
+  
+  # black dots (all months)
+geom_point(
+  data = event_months %>% 
+           left_join(monthly_summary, by = c("month" = "month")),
+  aes(x = month, y = mean_diff),
+  colour = "#74ac00",
+  size = 3
+) +
+
+  labs(
+    x = "Month",
+    y = "Difference in Cumulative Species Richness\n(with vs. without CNC)"
+  ) +
+  scale_x_date(
+    date_breaks = "6 months",
+    date_labels = "%b\n%Y"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+avg_diff
+# biological persistance of cnc at a national-scale
+```
+
+```{r difference curvers panel}
+p_facets <- ggplot(all_diffs, aes(x = month, y = diff)) +
+  geom_line(color = "steelblue", linewidth = 0.6) +
+  facet_wrap(~ city, ncol = 5) +          # 5 x 5 grid (25 cities)
+  labs(
+    x = "Month",
+    y = "Difference in Cumulative Species Richness\n(with vs. without CNC)",
+    title = "CNC Impact on Species Accumulation by City"
+  ) +
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold", size = 9),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    panel.grid.minor = element_blank()
+  )
+
+p_facets
+
+ggsave(
+  filename = "p_facets.png",
+  plot = p_facets,
+  width = 9, 
+  height = 12,
+  units = "in",
+  dpi = 900,
+  bg = "white"
+)
+
+```
+
+```{r sanity data check}
+# name check 
+hull_results <- process_inat_city(inat_hull, "Hull")
+tibble(
+  city = "Hull",
+  species = unique(hull_results$sac_with$month_species |> unlist())
+)
+species_hull <- tibble(species = unique(unlist(hull_results$sac_with$month_species)))
+hybrids_hull <- species_hull %>%
+  filter(str_detect(species, "×"))
+length(unique(inat_hull$taxon_species_name))
+length(unique(species_hull$species))
+
+# Unique names before cleaning
+all_names <- unique(inat_hull$scientific_name)
+
+# Classify by number of words and simplify (check names have been handled correctly)
+df_name_check <- tibble(
+  original = all_names,
+  n_words = str_count(all_names, "\\S+"),
+  simplified = if_else(
+    str_detect(all_names, "×"),
+    all_names,
+    word(all_names, 1, 2)
+  )
+)
+
+# Genus-only (1 word)
+genus_only <- df_name_check %>% filter(n_words == 1)
+
+# Subspecies/variety collapsing (≥3 words collapsing into same simplified name)
+collapsed <- df_name_check %>%
+  filter(n_words > 2) %>%
+  group_by(simplified) %>%
+  summarise(
+    n_sub_names = n_distinct(original),
+    .groups = "drop"
+  ) %>%
+  filter(n_sub_names > 1)
+
+# Summary table
+summary_tbl <- tibble(
+  total_unique_before = length(all_names),
+  genus_only = nrow(genus_only),
+  collapsed_species = nrow(collapsed),
+  total_unique_after = length(unique(df_name_check$simplified))
+)
+summary_tbl
+```
+
+```{r CNC impact per year}
+# Function to summarise CNC effect per year
+summarise_cnc_effect <- function(merged_df, city_name) {
+  merged_df %>%
+    mutate(year = lubridate::year(month)) %>%
+    group_by(year) %>%
+    summarise(
+      # Skip year if no data available
+      has_diff = any(!is.na(diff)),
+      
+      CNC_gain = if_else(
+        has_diff,
+        max(diff, na.rm = TRUE),      # Use the max difference (i.e, the end of the year)
+        NA_real_                       # no comparison possible
+      ),
+      baseline_richness = if_else(
+        any(!is.na(cum_species_without)),
+        max(cum_species_without, na.rm = TRUE),
+        NA_real_
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      percent_gain = if_else(
+        is.na(CNC_gain) | is.na(baseline_richness),
+        NA_real_,
+        round((CNC_gain / baseline_richness) * 100, 2)
+      ),
+      city = city_name
+    ) %>%
+    select(city, year, CNC_gain, baseline_richness, percent_gain) %>%
+    arrange(year)
+}
+
+# Apply function to each city and combine results
+cnc_summary_all <- purrr::map_dfr(results_list, ~ summarise_cnc_effect(.x$merged, .x$city))
+
+# View
+print(cnc_summary_all)
+
+# Lookup table for showing CNC years (data is viewed by participation year and not actual year in this analysis)
+cnc_participation <- tibble(
+  city = c("Hull", "Birmingham", "Liverpool", "Bristol", 
+           "Brighton", "York", "Staffordshire", "Cheshire", "North East", "London", "Manchester", "Lancashire",
+           "Oxfordshire", "Edinburgh", "Warwick and Solihull", "Suffolk" , "Belfast" , "Berkshire" , "Swansea" ,
+           "Dundee" , "Gloucestershire" , "Coventry" , "Cardiff" , "Nottingham" , "Glasgow"),
+  cnc_years = list(
+    c(2023, 2024, 2025),              # Hull
+    c(2020, 2021, 2022, 2023, 2024, 2025),  # Birmingham
+    c(2019, 2020, 2021, 2022, 2023, 2024, 2025),  # Liverpool
+    c(2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025),  # Bristol
+    c(2021, 2022, 2023, 2024, 2025),  # Brighton
+    c(2024, 2025),                    # York
+    c(2023, 2024, 2025),              # Staffordshire
+    c(2023, 2024, 2025),              # Cheshire
+    c(2019, 2020, 2021, 2022, 2023, 2024, 2025),  # North East
+    c(2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025),  # London
+    c(2019, 2020, 2021, 2022, 2023, 2024, 2025),  # Manchester
+    c(2020, 2021, 2022, 2024, 2025),        # Lancashire
+    c(2024, 2025),                    # Oxfordshire
+    c(2021, 2022, 2023, 2024, 2025),  # Greater Edinburgh
+    c(2023, 2024),                    # Warwick and Solihull
+    c(2023, 2024),                    # Suffolk
+    c(2024, 2025),                    # Belfast
+    c(2024, 2025),                    # Berkshire
+    c(2023, 2024, 2025),              # Swansea
+    c(2023, 2024, 2025),              # Dundee
+    c(2021, 2022, 2023, 2024),        # Gloucestershire
+    c(2021, 2022, 2023, 2024),        # Coventry
+    c(2021, 2022, 2023, 2025),        # Cardiff and Newport
+    c(2020, 2021, 2022, 2023, 2024, 2025),   # Nottingham
+    c(2021, 2022, 2023, 2024, 2025)   # Glasgow
+    )
+)
+
+#
+cnc_summary_marked <- cnc_summary_all %>%
+  left_join(cnc_participation, by = "city") %>%
+  mutate(
+    participation_year = purrr::map2_dbl(year, cnc_years, ~ match(.x, .y)),
+    is_cnc_year = !is.na(participation_year)
+  )
+
+# Join the CNC participation info to summary table
+cnc_summary_marked <- cnc_summary_all %>%
+  left_join(cnc_participation, by = "city") %>%
+  mutate(
+    participation_year = purrr::map2_dbl(year, cnc_years, ~ match(.x, .y)),
+    is_cnc_year = !is.na(participation_year)
+  ) %>%
+  group_by(city) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    prev_year_available = (year - 1) %in% year,
+    unusable_cnc_year = is_cnc_year & !prev_year_available,
+    CNC_gain     = if_else(unusable_cnc_year, NA_real_, CNC_gain),
+    percent_gain = if_else(unusable_cnc_year, NA_real_, percent_gain)
+  ) %>%
+  ungroup()
+
+# run plot
+ggplot(
+  cnc_summary_marked %>%
+    filter(is_cnc_year, !is.na(percent_gain)),
+  aes(x = participation_year, y = percent_gain, color = city, group = city)
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  labs(
+    title = "CNC Contribution to Species Richness by Participation Year",
+    x = "Participation year (since first CNC)",
+    y = "Percent gain in species richness",
+    color = "City"
+  ) +
+  scale_x_continuous(breaks = 1:10) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+```{r cnc contribution per year}
+cnc_year_summary <- cnc_summary_marked %>%
+  filter(is_cnc_year, !is.na(percent_gain)) %>%
+  arrange(city, year) %>%
+  group_by(city) %>%
+  mutate(
+    cnc_participation_number = participation_year,
+    year_label = paste0("CNC Year ", participation_year)
+  ) %>%
+  ungroup()
+
+#
+ggplot(cnc_year_summary, aes(x = cnc_participation_number, y = percent_gain, color = city, group = city)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_x_continuous(
+    breaks = 1:5,
+    labels = paste("Year", 1:5)
+  ) +
+  labs(
+    title = "Change in CNC Impact Across Participation Years",
+    subtitle = "Does CNC Year 1 show the strongest biodiversity gain?",
+    x = "CNC Participation Year (relative)",
+    y = "Percent Gain in Species Richness",
+    color = "City"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 0)
+  )
+
+# avg.
+cnc_year_avg <- cnc_year_summary %>%
+  group_by(cnc_participation_number) %>%
+  summarise(
+    mean_percent_gain = mean(percent_gain, na.rm = TRUE),
+    sd_percent_gain = sd(percent_gain, na.rm = TRUE),
+    n_cities = n()
+  )
+
+## # Ensure consistent x-scaling (continuous)
+breaks_years <- cnc_year_avg$cnc_participation_number
+labels_years <- paste("Year", breaks_years)
+
+T1 <- ggplot(cnc_year_avg, aes(x = cnc_participation_number, y = mean_percent_gain)) +
+  geom_line(color = "steelblue", linewidth = 1.3) +
+  geom_point(size = 3, color = "darkorange") +
+  geom_errorbar(aes(ymin = mean_percent_gain - sd_percent_gain,
+                    ymax = mean_percent_gain + sd_percent_gain),
+                width = 0.1, alpha = 0.6) +
+  scale_x_continuous(
+    breaks = cnc_year_avg$cnc_participation_number,
+    labels = paste("Year", cnc_year_avg$cnc_participation_number)
+  ) +
+  labs(
+    title = "Average CNC Impact Across Participation Years",
+    subtitle = "Mean percent gain in species richness across all cities",
+    x = "CNC Participation Year",
+    y = "Average Percent Gain in Species Richness"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+# option 2 
+ggplot() +
+  geom_line(data = cnc_year_summary, aes(x = cnc_participation_number, y = percent_gain, group = city),
+            color = "grey80", alpha = 0.7) +
+  geom_line(data = cnc_year_avg, aes(x = cnc_participation_number, y = mean_percent_gain),
+            color = "steelblue", linewidth = 1.3) +
+  geom_point(data = cnc_year_avg, aes(x = cnc_participation_number, y = mean_percent_gain),
+             color = "darkorange", size = 3) +
+  labs(
+    title = "Average CNC Impact Across Participation Years",
+    subtitle = "Thin grey lines = individual cities; blue line = mean trend",
+    x = "CNC Participation Year",
+    y = "Percent Gain in Species Richness"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Boxplot
+T2 <- ggplot(cnc_year_summary, aes(x = factor(cnc_participation_number), y = percent_gain)) +
+  # Boxplots show distribution across cities
+  geom_boxplot(outlier.shape = NA, fill = "grey90", color = "grey40", width = 0.5) +
+  
+  # Jittered points show individual city results
+  geom_jitter(aes(color = city), width = 0.15, alpha = 0.7, size = 2.5) +
+  
+  # Axis formatting
+  scale_x_discrete(labels = paste("Year", cnc_year_avg$cnc_participation_number)) +
+  labs(
+    title = "",
+    subtitle = "",
+    x = "CNC Participation Year",
+    y = "Percent Gain in Species Richness",
+    color = "City"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(size = 12),
+    legend.position = "none"  # optional, to declutter
+  )
+```
+
+```{r annual declines model}
+# models
+mod_mixed <- lmer(percent_gain ~ cnc_participation_number + 
+                  (cnc_participation_number | city), 
+                  data = cnc_year_summary,
+                  REML = FALSE)
+summary(mod_mixed) # dont have enough data
+
+## lm (linear)
+mod_simple <- lmer(percent_gain ~ cnc_participation_number + (1 | city),
+                   data = cnc_year_summary,
+                   REML = FALSE)
+
+summary(mod_simple) # good
+residuals(mod_simple)
+deviance(mod_simple)
+plot(mod_simple)                          # residuals vs fitted
+sim_res <- simulateResiduals(mod_simple, n = 1000)
+plot(sim_res)
+testOutliers(sim_res)
+
+## non-linear (not better with the data available)
+mod_nonlinear <- lmer(
+  percent_gain ~ poly(cnc_participation_number, 2, raw = TRUE) + (1 | city),
+  data = cnc_year_summary,
+  REML = FALSE
+)
+summary(mod_nonlinear)
+
+# Diagnostics
+plot(mod_nonlinear)
+sim_res <- simulateResiduals(mod_nonlinear, n = 1000) # significant effects
+plot(sim_res)
+testOutliers(sim_res)
+```
+
+```{r annual declines model - plot}
+# Packages needed for colours + compressing y axis
+library(viridis)  # if not already loaded
+library(ggbreak)
+
+
+# Build prediction grid (numeric)
+newdat <- data.frame(
+  cnc_participation_number = 1:8,
+  city = NA
+)
+
+# Predict from the mixed model (numeric predictor)
+pred <- predict(
+  mod_simple,
+  newdata = newdat,
+  se.fit = TRUE,
+  re.form = NA
+)
+
+newdat$fit   <- pred$fit
+newdat$se    <- pred$se.fit
+newdat$lower <- newdat$fit - 1.96 * newdat$se
+newdat$upper <- newdat$fit + 1.96 * newdat$se
+
+
+# Plot — convert x to factor ONLY inside ggplot
+
+# Copy model CI to plotting CI (safe)
+newdat$lower_plot <- pmax(newdat$lower, 0)
+newdat$upper_plot <- pmin(newdat$upper, 40)
+
+participation_yr <- ggplot(
+  cnc_year_summary,
+  aes(x = factor(cnc_participation_number), y = percent_gain)
+) +
+  geom_jitter(
+    color = "grey50",
+    width = 0.15,
+    size = 2,
+    alpha = 0.6
+  ) +
+  geom_ribbon(
+    data = newdat,
+    inherit.aes = FALSE,
+    aes(
+      x = factor(cnc_participation_number),
+      ymin = lower_plot,
+      ymax = upper_plot,
+      group = 1
+    ),
+    fill = "#74ac00",
+    alpha = 0.25
+  ) +
+  geom_line(
+    data = newdat,
+    inherit.aes = FALSE,
+    aes(
+      x = factor(cnc_participation_number),
+      y = fit,
+      group = 1
+    ),
+    color = "#74ac00",
+    linewidth = 1.2
+  ) +
+  
+  # Y-axis with break between 20 and 35
+  scale_y_continuous(
+    limits = c(0, 40),
+    breaks = c(0, 5, 10, 15, 20, 35, 40)
+  ) +
+  scale_y_break(c(20, 35), ticklabels = c(20, 35, 40)) +
+  
+  labs(
+    x = "CNC Participation Year",
+    y = "Percent Gain in Species Richness"
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.y.right = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+participation_yr
+
+# table
+cnc_year_stats <- cnc_year_summary %>%
+  group_by(cnc_participation_number) %>%
+  summarise(
+    n = n(),
+    mean = round(mean(percent_gain, na.rm = TRUE), 2),
+    sd   = round(sd(percent_gain, na.rm = TRUE), 2),
+    min  = round(min(percent_gain, na.rm = TRUE), 2),
+    max  = round(max(percent_gain, na.rm = TRUE), 2)
+  )
+common_theme <- theme_minimal(base_size = 13) +
+  theme(
+    axis.title = element_text(size = 12),
+    axis.text  = element_text(size = 10),
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 9),
+    plot.margin  = margin(5, 10, 5, 10)
+  )
+  
+  combined_fig <- avg_diff / participation_yr +
+  plot_layout(heights = c(1, 1))  # top panel a bit taller
+
+combined_fig
+
+ggsave(
+  filename = "cnc_contribution.png",
+  plot = combined_fig,
+  width = 10, 
+  height = 10,
+  units = "in",
+  dpi = 400
+)
+```
+
+```{r unique cnc taxa}
+# process_cnc_city
+process_cnc_city <- function(city_results) {
+  city_name <- city_results$city
+  message("Processing CNC summary for ", city_name, "...")
+
+# Extract the cleaned data (already research grade + simplified)
+inat_clean <- city_results$clean_df
+
+# CNC weekend date ranges
+cnc_ranges <- list(
+    "2021" = as.Date(c("2021-04-30", "2021-05-03")),
+    "2022" = as.Date(c("2022-04-29", "2022-05-02")),
+    "2023" = as.Date(c("2023-04-28", "2023-05-01")),
+    "2024" = as.Date(c("2024-04-26", "2024-04-29")),
+    "2025" = as.Date(c("2025-04-25", "2025-04-28"))
+)
+
+# Separate CNC vs non-CNC observations
+inat_no_cnc <- inat_clean %>%
+  filter(
+    !(date >= cnc_ranges[["2021"]][1] & date <= cnc_ranges[["2021"]][2]) &
+    !(date >= cnc_ranges[["2022"]][1] & date <= cnc_ranges[["2022"]][2]) &
+    !(date >= cnc_ranges[["2023"]][1] & date <= cnc_ranges[["2023"]][2]) &
+    !(date >= cnc_ranges[["2024"]][1] & date <= cnc_ranges[["2024"]][2]) &
+    !(date >= cnc_ranges[["2025"]][1] & date <= cnc_ranges[["2025"]][2])
+    )
+
+cnc_observations <- anti_join(inat_clean, inat_no_cnc, by = "id")
+
+# CNC-unique species (species not seen outside CNC)
+  cnc_unique <- cnc_observations %>%
+    anti_join(inat_no_cnc, by = "scientific_name") %>%
+    select(scientific_name, iconic_taxon_name, user_id, date, month) %>%
+    add_count(scientific_name, name = "obs_count") %>%
+    distinct(scientific_name, .keep_all = TRUE) %>%
+    arrange(desc(obs_count), iconic_taxon_name, scientific_name)
+
+#  Rename to user friendly names
+cnc_unique <- cnc_unique %>%
+    mutate(
+      taxon_group = case_when(
+        iconic_taxon_name %in% c("Reptilia", "Amphibia") ~ "Reptiles and Amphibians",
+        iconic_taxon_name %in% c("Chromista", "Protozoa") ~ "Protozoa and Chromista",
+        iconic_taxon_name == "Animalia" ~ "Other Animalia",
+        iconic_taxon_name == "Actinopterygii" ~ "Fishes",
+        iconic_taxon_name == "Aves" ~ "Birds",
+        iconic_taxon_name == "Plantae" ~ "Plants",
+        iconic_taxon_name == "Fungi" ~ "Fungus",
+        iconic_taxon_name == "Insecta" ~ "Insects",
+        iconic_taxon_name == "Arachnida" ~ "Spiders",
+        iconic_taxon_name == "Mollusca" ~ "Molluscs",
+        iconic_taxon_name == "Mammalia" ~ "Mammals",
+        TRUE ~ iconic_taxon_name
+      )
+    )
+
+# Taxonomic summary
+taxonomic_summary <- cnc_unique %>%
+  count(taxon_group, sort = TRUE) %>%
+  mutate(percentage = round(n / sum(n) * 100, 1)) %>%
+  filter(!is.na(taxon_group) & taxon_group != "Unknown")
+
+# Summary statistics
+  stats <- tibble(
+    city = city_name,
+    total_cnc_unique_species = nrow(cnc_unique),
+    single_obs = sum(cnc_unique$obs_count == 1),
+    two_to_five = sum(cnc_unique$obs_count %in% 2:5),
+    six_plus = sum(cnc_unique$obs_count >= 6)
+  )
+
+# Return structured list
+  list(
+    city = city_name,
+    cnc_unique = cnc_unique,
+    taxonomic_summary = taxonomic_summary,
+    summary_stats = stats
+  )
+}
+
+# Process CNC summaries for all cities
+
+# Process all cities through your main inat processing function
+results_list <- imap(datasets, process_inat_city)
+
+# Apply CNC summary function to each processed result
+cnc_results <- map(results_list, process_cnc_city)
+
+# Combine CNC summary stats into one data frame
+cnc_summary_all <- map_dfr(cnc_results, ~ .x$summary_stats)
+
+# Combine taxonomic breakdowns for all cities
+cnc_taxa_all <- map_dfr(
+  cnc_results,
+  ~ .x$taxonomic_summary %>%
+    mutate(city = .x$city)
+)
+
+# Summary CNC-unique species
+print(cnc_summary_all)
+
+# select colours for groups
+taxon_group <- c(
+  "Birds"                   = "#E76F51",
+  "Mammals"                 = "#2A9D8F",
+  "Reptiles and Amphibians" = "#52B788",
+  "Fungus"                  = "#F4A261",
+  "Plants"                  = "#74ac00AA",
+  "Insects"                 = "#93914c",
+  "Spiders"                 = "#E69A8D",
+  "Molluscs"                = "#457B9D",
+  "Fishes"                  = "#00B4D8",
+  "Other Animalia"          = "#ADB5BD",
+  "Protozoa and Chromista"  = "#B56576"
+)
+
+# Calculate total unique species per city and define order
+city_totals <- cnc_taxa_all %>%
+  group_by(city) %>%
+  summarise(total_n = sum(n, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total_n))
+
+city_order <- city_totals$city 
+
+# Unique species totals bar plot
+p1 <- ggplot(city_totals, aes(x = fct_reorder(city, -total_n), y = total_n)) +
+  geom_col(fill = "grey60") +
+  labs(
+    x = "",
+    y = "Number of CNC-unique species",
+    title = ""
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    
+    # 🔥 Remove vertical gridlines
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+
+# Stacked bar
+p2 <- ggplot(
+  cnc_taxa_all %>% mutate(city = factor(city, levels = city_order)),
+  aes(x = city, y = n, fill = taxon_group)
+) +
+  geom_col(position = "fill") +
+  scale_fill_manual(values = taxon_group) +
+  labs(
+    x = "",
+    y = "Proportion of CNC-unique species",
+    fill = "Taxonomic group"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      hjust = 1,
+      vjust = 0.5        # <-- fixes label gap
+    ),
+    plot.margin = margin(t = -5, r = 10, b = 0, l = 10),
+     panel.grid.major.x = element_blank(),
+     panel.grid.minor.x = element_blank(),
+     panel.grid.minor.y = element_blank(),
+     panel.grid.major.y = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text  = element_text(size = 11)
+  )
+
+# combine
+combined_plot <- p1 / p2 +
+  plot_layout(heights = c(1, 2))  # bottom plot taller
+
+# view
+```
+
+```{r unique cnc taxa}
+combined_plot
+combined_plot <- combined_plot &
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 14)
+  )
+ggsave(
+  filename = "cnc_species_comp.png",
+  plot = combined_plot,
+  width = 10, 
+  height = 10,
+  units = "in",
+  dpi = 400
+)
+```
+
+```{r sliding window}
+inat_all <- bind_rows(
+  mutate(inat_hull, city = "Hull"),
+  mutate(inat_birm, city = "Birmingham"),
+  mutate(inat_liver, city = "Liverpool"),
+  mutate(inat_brist, city = "Bristol"),
+  mutate(inat_brig, city = "Brighton"),
+  mutate(inat_york, city = "York"),
+  mutate(inat_staff, city = "Staffordshire"),
+  mutate(inat_chesh, city = "Cheshire"),
+  mutate(inat_northeast, city = "North East"),
+  mutate(inat_london, city = "London"),
+  mutate(inat_man, city = "Manchester"),
+  mutate(inat_lanc, city = "Lancashire"),
+  mutate(inat_oxf, city = "Oxfordshire"),
+  mutate(inat_ed, city = "Edinburgh"),
+  mutate(inat_war_sol, city = "Warwick and Solihull"),
+  mutate(inat_suffolk, city = "Suffolk"),
+  mutate(inat_belfast, city = "Belfast"),
+  mutate(inat_berk, city = "Berkshire"),
+  mutate(inat_swansea, city = "Swansea"),
+  mutate(inat_dundee, city = "Dundee"),
+  mutate(inat_gloucest, city = "Gloucestershire"),
+  mutate(inat_coventry, city = "Coventry"),
+  mutate(inat_cardnew, city = "Cardiff"),
+  mutate(inat_nott, city = "Nottingham"),
+  mutate(inat_glas, city = "Glasgow")
+)
+
+inat_all <- inat_all %>%
+  mutate(
+    observed_on = as.Date(observed_on),
+    year = year(observed_on)
+  )
+
+cnc_participation_long <- cnc_participation %>% unnest(cnc_years)
+
+inat_all <- inat_all %>%
+  inner_join(cnc_participation_long, by = c("city", "year" = "cnc_years")) %>%
+  mutate(
+    cnc_start = case_when(
+      year == 2021 ~ as.Date("2021-04-30"),
+      year == 2022 ~ as.Date("2022-04-29"),
+      year == 2023 ~ as.Date("2023-04-28"),
+      year == 2024 ~ as.Date("2024-04-26"),
+      year == 2025 ~ as.Date("2025-04-25"),
+      TRUE ~ NA_Date_
+    ),
+    weeks_from_cnc = floor(as.numeric(difftime(observed_on, cnc_start, units = "days")) / 7)
+  )
+
+# Weekly user counts
+weekly_users <- inat_all %>%
+  filter(between(weeks_from_cnc, -5, 5)) %>%
+  group_by(city, year, weeks_from_cnc) %>%
+  summarise(unique_users = n_distinct(user_id), .groups = "drop")
+
+# Mean ± SE per city
+city_summary <- weekly_users %>%
+  group_by(city, weeks_from_cnc) %>%
+  summarise(
+    mean_users = mean(unique_users, na.rm = TRUE),
+    sd_users   = sd(unique_users, na.rm = TRUE),
+    n_years    = n(),
+    se_users   = sd_users / sqrt(n_years),
+    .groups = "drop"
+  )
+
+# Absolute engagement
+ggplot(city_summary, aes(x = weeks_from_cnc, y = mean_users)) +
+  geom_col(fill = "skyblue") +
+  geom_errorbar(aes(ymin = mean_users - se_users, ymax = mean_users + se_users),
+                width = 0.3, color = "gray30") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  facet_wrap(~ city, scales = "free_y", ncol = 4) +
+  labs(x = "Weeks relative to CNC", y = "Mean unique users (±SE)") +
+  theme_minimal(base_size = 12)
+
+# Relative engagement
+city_summary <- city_summary %>%
+  group_by(city) %>%
+  mutate(
+    baseline = mean(mean_users[weeks_from_cnc < 0], na.rm = TRUE),
+    rel_users = (mean_users / baseline) * 100,
+    rel_se = (se_users / baseline) * 100,
+    max_rel = max(rel_users, na.rm = TRUE)  # for ordering
+  ) %>%
+  ungroup() %>%
+  mutate(city = fct_reorder(city, -max_rel))
+
+ggplot(city_summary, aes(x = weeks_from_cnc, y = rel_users)) +
+  # highlight CNC week without warning
+  annotate("rect",
+           xmin = -0.5, xmax = 0.5, ymin = -Inf, ymax = Inf,
+           fill = "grey90", alpha = 0.5) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(aes(ymin = rel_users - rel_se, ymax = rel_users + rel_se),
+                width = 0.25, color = "gray30") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  facet_wrap(~ city, ncol = 4) +
+  coord_cartesian(ylim = c(0, 450)) +
+  labs(
+    title = "Weekly Engagement Relative to the City Nature Challenge",
+    subtitle = "Mean engagement (± SE) expressed as % of pre-CNC baseline",
+    x = "Weeks relative to CNC",
+    y = "Engagement (% of pre-CNC mean ± SE)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.text = element_text(face = "bold", size = 11),
+    panel.spacing = unit(1.2, "lines"),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+    plot.subtitle = element_text(hjust = 0.5, size = 12)
+  )
+```
+
+```{r model for engagement (exploration)}
+# create cnc variable
+city_summary <- city_summary %>%
+  mutate(
+    is_cnc_week = if_else(weeks_from_cnc == 0, 1, 0)
+  )
+#log
+city_summary <- city_summary %>%
+  mutate(log_rel_users = log(rel_users))
+
+# diagnostics
+hist(city_summary$rel_users)
+hist(log(city_summary$rel_users))
+
+# fixed model
+m_fixed <- lm(rel_users ~ is_cnc_week, data = city_summary)
+summary(m_fixed)
+
+#log
+m_log <- lm(log_rel_users ~ is_cnc_week, data = city_summary)
+summary(m_log)
+
+
+# diagnostics of two models
+par(mfrow = c(2, 2))
+plot(m_fixed)
+par(mfrow = c(1, 1))
+
+par(mfrow = c(2, 2))
+plot(m_log)
+par(mfrow = c(1, 1))
+```
+
+```{r polynomial model to account for seasonal increase in engagement}
+# CNC Engagement
+
+# Fit quadratic model
+m_poly <- lm(rel_users ~ is_cnc_week + poly(weeks_from_cnc, 2), data = city_summary)
+summary(m_poly)
+par(mfrow = c(2, 2))
+plot(m_poly)
+par(mfrow = c(1, 1))
+# Create smooth prediction data
+newdata <- expand.grid(
+  weeks_from_cnc = seq(min(city_summary$weeks_from_cnc), max(city_summary$weeks_from_cnc), length.out = 200),
+  is_cnc_week = 0
+)
+
+# Predict with 95% CI
+pred_poly <- cbind(
+  newdata,
+  predict(m_poly, newdata, interval = "confidence")
+)
+
+# Make the plot
+user_plot <- ggplot() +
+  
+  # Raw data (city-level points)
+  geom_point(
+    data = city_summary,
+    aes(x = weeks_from_cnc, y = rel_users),
+    alpha = 0.5, color = "grey60", size = 2
+  ) +
+  
+  # Confidence ribbon (use inherit.aes = FALSE)
+  geom_ribbon(
+    data = pred_poly,
+    aes(x = weeks_from_cnc, ymin = lwr, ymax = upr),
+    fill = "#74ac00AA", alpha = 0.5, inherit.aes = FALSE
+  ) +
+  
+  # Fitted polynomial line
+  geom_line(
+    data = pred_poly,
+    aes(x = weeks_from_cnc, y = fit),
+    color = "black", linewidth = 0.8
+  ) +
+  
+  # CNC week vertical line
+  geom_vline(xintercept = 0, linetype = "solid", color = "grey60", linewidth = 0.6) +
+  
+  # Highlight CNC week points
+  geom_point(
+    data = filter(city_summary, weeks_from_cnc == 0),
+    aes(x = weeks_from_cnc, y = rel_users),
+    color = "#74ac00", size = 3, alpha = 0.6
+  ) +
+  
+  # Labels and theme
+  labs(
+    title = "",
+    subtitle = "",
+    x = "Weeks relative to CNC",
+    y = "Engagement Increase Compared to Baseline (%)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12),
+    axis.line.x = element_line(color = "darkgrey", size = 0.8),
+    axis.ticks.x = element_line(color = "darkgrey", size = 0.8)
+    )
+user_plot
+
+#
+ggsave(
+  filename = "user_increase_A4.png",
+  plot = user_plot,
+  width = 8, 
+  height = 6,
+  units = "in",
+  bg = "white",
+  dpi = 400
+)
+```
+
+```{r unique taxa code}
+library(dplyr)
+library(MASS)
+
+# --- NEW MODELLING CHUNK (safe to append at end) ---
+
+# 1. Create city-level baseline and CNC user metrics
+baseline_users <- weekly_users %>%
+  filter(weeks_from_cnc %in% -5:-1) %>%
+  group_by(city) %>%
+  summarise(baseline_users = mean(unique_users, na.rm = TRUE), .groups = "drop")
+
+cnc_users <- weekly_users %>%
+  filter(weeks_from_cnc %in% 0:1) %>%
+  group_by(city) %>%
+  summarise(cnc_users = mean(unique_users, na.rm = TRUE), .groups = "drop")
+
+# 2. Compute correct city-level rel_users
+city_user_metrics <- baseline_users %>%
+  left_join(cnc_users, by = "city") %>%
+  mutate(
+    rel_users = cnc_users / baseline_users   # *ratio*, not weekly %
+  )
+
+# 3. Build modelling dataset (one row per city)
+model_df <- city_totals %>%                       # contains total_n or unique taxa
+  left_join(inat_urb %>% rename(city = City), by = "city") %>%  # per_urban
+  left_join(city_user_metrics, by = "city") %>%   # rel_users, baseline_users, cnc_users
+  mutate(
+    CNC_area_km2 = CNC_area / 1e6
+  )
+
+#
+model_df <- model_df %>%
+  dplyr::select(city, total_n, rel_users, per_urban, CNC_area_km2) %>%
+  tidyr::drop_na()
+
+
+# 4. Negative Binomial models
+library(MASS)
+
+m_nb <- glm.nb(total_n ~ rel_users + per_urban + CNC_area_km2,
+               data = model_df)
+summary(m_nb)
+sim_nb <- simulateResiduals(m_nb)
+plot(sim_nb)
+plot(sim_nb, quantreg = FALSE) # suitable for small sample
+
+# Optional: interaction model
+m_nb_int <- glm.nb(total_n ~ rel_users * per_urban + CNC_area_km2,
+                   data = model_df)
+
+AIC(m_nb, m_nb_int)
+summary(m_nb_int)
+
+# model checks
+library(corrplot)
+
+num_vars <- model_df %>%
+  dplyr::select(rel_users, per_urban, CNC_area_km2)
+
+cor_matrix <- cor(num_vars, use = "pairwise.complete.obs")
+print(cor_matrix)
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "lower",
+  tl.col = "black",
+  addCoef.col = "black"  # 👈 adds numbers
+)
+
+library(car)
+vif(m_nb)
+pearson_resid <- residuals(m_nb, type = "pearson")
+dispersion <- sum(pearson_resid^2) / m_nb$df.residual
+dispersion
+
+#
+model_df$pred  <- predict(m_nb, type = "response")
+model_df$resid <- residuals(m_nb, type = "pearson")
+
+ggplot(model_df, aes(x = pred, y = resid)) +
+  geom_point(size = 3, colour = "black") +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  labs(x = "Fitted values",
+       y = "Pearson residuals",
+       title = "Residuals vs Fitted Values") +
+  theme_minimal(base_size = 13)
+
+#
+cooks <- cooks.distance(m_nb)
+
+plot(cooks, type = "h", main = "Cook's distance")
+abline(h = 4/nrow(model_df), col = "red", lty = 2)
+
+#
+ggplot(model_df, aes(x = pred, y = total_n)) +
+  geom_point(size = 3, colour = "darkred") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(x = "Predicted", y = "Observed",
+       title = "Observed vs Predicted Values (NB Model)") +
+  theme_minimal(base_size = 13)
+
+#
+library(pscl)
+pR2(m_nb)
+```
+
+```{r unique taxa code}
+library(effects)
+
+eff_rel <- effect("rel_users", m_nb, 
+                  xlevels = list(rel_users = seq(min(model_df$rel_users),
+                                                 max(model_df$rel_users), 
+                                                 length = 100)))
+
+eff_rel_df <- as.data.frame(eff_rel)
+
+# Plot
+p_rel <- ggplot(eff_rel_df, aes(x = rel_users, y = fit)) +
+  geom_line(size = 1.2, colour = "#74ac00") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "#74ac00") +
+  labs(
+    x = "Relative engagement increase (CNC / baseline)",
+    y = "Total number of unique records",
+    title = ""
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title   = element_text(size = 20, face = "bold", hjust = 0.5),
+
+    # --- axis title margins ---
+    axis.title.x = element_text(
+      size = 18,
+      margin = margin(t = 12)  # move x-axis title downward
+    ),
+    axis.title.y = element_text(
+      size = 18,
+      margin = margin(r = 20)  # move y-axis title leftward
+    ),
+
+    # --- axis tick label size ---
+    axis.text    = element_text(size = 18),
+
+    # --- overall plot margins (optional) ---
+    plot.margin = margin(t = 15, r = 15, b = 15, l = 15)
+  )
+p_rel
+#
+ggsave(
+  filename = "relative_engagement_effect_A4.png",
+  plot = p_rel,
+  width = 11.69, 
+  height = 8.27,
+  units = "in",
+  dpi = 400
+)
+```
