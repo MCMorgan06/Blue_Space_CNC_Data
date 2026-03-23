@@ -1,0 +1,2206 @@
+---
+title: "iNat_SAC"
+output: html_document
+date: "2025-09-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+library(sf)
+library(patchwork)
+library(terra)
+library(exactextractr)
+library(purrr)
+library(vegan)
+library(tidyverse)
+library(tidyr)
+library(MASS)
+```
+
+```{r data_import, , include=FALSE}
+inat_hull <- read_csv("hull_all.csv")
+```
+
+```{r descriptives}
+users <- unique(inat_hull$user_id)
+```
+
+```{r data cleaning}
+# Filter to research grade, species level & remove NA
+inat_hull_clean <- inat_hull %>%
+  filter(!is.na(license) & str_trim(license) != "") %>%
+  filter(quality_grade == "research") %>%  # only research-grade
+  mutate(
+    # If it's a hybrid (contains ×), keep the full name; otherwise take first two words
+    scientific_name = if_else(
+      str_detect(scientific_name, "×"),
+      scientific_name,  # keep hybrids as-is
+      word(scientific_name, 1, 2)  # take first two words (Genus + species)
+    )
+  )%>%
+  drop_na(scientific_name)
+
+# check remaining licences
+table(inat_hull_clean$license)
+```
+
+```{r quality check}
+# check length of scientific names
+cat("Word counts in inat_hull_clean:\n")
+table(str_count(inat_hull_clean$scientific_name, "\\S+"))
+
+# Count words in each scientific name
+word_counts <- str_count(inat_hull_clean$scientific_name, "\\S+")
+
+# Filter for 3, 4, or 5 words
+subset_names <- inat_hull_clean$scientific_name[word_counts %in% 3:5]
+
+# check for subspecies
+cat("Scientific names with 3, 4, or 5 words:\n")
+print(subset_names)
+```
+
+```{r aggregate by month}
+inat_hull_clean <- inat_hull_clean %>%
+  mutate(
+    date = as.Date(observed_on),                  # YYYY-MM-DD
+    month = floor_date(date, "month")             # rounds down to first of month
+  )
+
+# Subset to Sep 2020 - Sep 2025 and create Sep->Sep "biological year"
+inat_hull_sub <- inat_hull_clean %>%
+  filter(date >= as.Date("2020-09-01") & date <= as.Date("2025-09-30")) %>%
+  mutate(sep_year = year(date + months(3)))       # shifts Sep->Jan for year labeling
+
+# Aggregate species by month
+sac_df <- inat_hull_sub %>%
+  arrange(date) %>%
+  group_by(month) %>%
+  summarise(month_species = list(unique(scientific_name))) %>%
+  ungroup()
+
+# Compute true cumulative species richness
+seen_species <- c()
+cum_species <- c()
+
+for (sp in sac_df$month_species) {
+  seen_species <- unique(c(seen_species, sp))   # add new species
+  cum_species <- c(cum_species, length(seen_species))
+}
+
+sac_df$cum_species <- cum_species
+
+# Quick check
+tail(sac_df)
+
+# plot
+ggplot(sac_df, aes(x = month, y = cum_species)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "steelblue", size = 2) +
+  labs(x = "Month", y = "Cumulative Species Richness",
+       title = "Monthly Species Accumulation Curve (Hull iNaturalist)") +
+  theme_minimal()
+
+# write subset
+write.csv(inat_hull_sub, "inat_hull_sub.csv", row.names = FALSE)
+```
+
+```{r remove CNC}
+# Define CNC weekend ranges
+cnc_ranges <- list(
+  "2023" = as.Date(c("2023-04-28", "2023-05-01")),
+  "2024" = as.Date(c("2024-04-26", "2024-04-29")),
+  "2025" = as.Date(c("2025-04-25", "2025-04-28"))
+)
+
+# Filter out CNC weekends
+inat_no_cnc <- inat_hull_sub %>%
+  filter(
+    !(date >= cnc_ranges[["2023"]][1] & date <= cnc_ranges[["2023"]][2]) &
+    !(date >= cnc_ranges[["2024"]][1] & date <= cnc_ranges[["2024"]][2]) &
+    !(date >= cnc_ranges[["2025"]][1] & date <= cnc_ranges[["2025"]][2])
+  )
+
+# Aggregate species by month (same as before)
+sac_no_cnc <- inat_no_cnc %>%
+  arrange(date) %>%
+  group_by(month) %>%
+  summarise(month_species = list(unique(scientific_name))) %>%
+  ungroup()
+
+# Compute cumulative species
+seen_species <- c()
+cum_species <- c()
+for (sp in sac_no_cnc$month_species) {
+  seen_species <- unique(c(seen_species, sp))
+  cum_species <- c(cum_species, length(seen_species))
+}
+sac_no_cnc$cum_species <- cum_species
+
+
+# Plot SAC with and without CNC
+ggplot() +
+  geom_line(data = sac_df, aes(x = month, y = cum_species), color = "orange", size = 1.2, linetype = "dashed") +
+  geom_line(data = sac_no_cnc, aes(x = month, y = cum_species), color = "steelblue", size = 1.2) +
+  labs(x = "Month", y = "Cumulative Species Richness",
+       title = "Species Accumulation Curve: With vs Without CNC") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "3 months")
+
+# plot 2
+merged_df <- merge(sac_df, sac_no_cnc, by = "month", suffixes = c("_with", "_without"))
+
+ggplot(merged_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = cum_species_without, ymax = cum_species_with), fill = "orange", alpha = 0.2) +
+  geom_line(aes(y = cum_species_with), color = "orange", size = 1.2, linetype = "dashed") +
+  geom_line(aes(y = cum_species_without), color = "steelblue", size = 1.2) +
+  labs(x = "Month", y = "Cumulative Species Richness",
+       title = "Species Accumulation Curve: With vs Without CNC") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "4 month")
+```
+
+```{r differences over time}
+# Merge the two datasets by month
+merged_df <- merge(sac_df, sac_no_cnc, by = "month", suffixes = c("_with", "_without"))
+
+# Create a new column for the difference
+merged_df$diff <- merged_df$cum_species_with - merged_df$cum_species_without
+
+# View the difference
+head(merged_df)
+
+# plot the difference over time
+library(ggplot2)
+ggplot(merged_df, aes(x = month, y = diff)) +
+  geom_line(color = "red", size = 1.2) +
+  labs(x = "Month", y = "Difference in Cumulative Species Richness",
+       title = "Difference Between With vs Without CNC") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "3 months")
+
+```
+
+```{r recorders}
+# Must have at least: recorder_id, date
+records_summary <- inat_hull_sub %>%
+  mutate(year = year(date),
+         month = floor_date(date, "month")) %>%  # group by month
+  group_by(year, month, user_id) %>%
+  summarise(n_records = n(), .groups = "drop") %>%
+  group_by(year, month) %>%
+  mutate(pct_records = 100 * n_records / sum(n_records))
+
+# Ranked
+ranked_summary <- records_summary %>%
+  group_by(year, month) %>%
+  mutate(rank = rank(-n_records, ties.method = "first"))
+
+#
+cum_contrib <- ranked_summary %>%
+  arrange(year, month, rank) %>%
+  group_by(year, month) %>%
+  mutate(cum_pct = cumsum(pct_records))
+
+# month stat
+contrib_stats <- cum_contrib %>%
+  group_by(year, month) %>%
+  summarise(
+    n_to_50pct = min(rank[cum_pct >= 50]),   # number of recorders needed to reach 50%
+    n_to_80pct = min(rank[cum_pct >= 80])    # number needed to reach 80%
+  )
+
+#month 
+ggplot(contrib_stats, aes(x = factor(year), y = n_to_50pct)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(x = "Year", y = "Recorders needed to reach 50%",
+       title = "Broadening of Recorder Contributions Over Time") +
+  theme_minimal()
+
+##
+species_summary <- inat_hull_sub %>%
+  mutate(year = year(date),
+         month = floor_date(date, "month")) %>%
+  group_by(year, month, user_id) %>%
+  summarise(n_species = n_distinct(scientific_name), .groups = "drop") %>%
+  group_by(year, month) %>%
+  mutate(pct_species = 100 * n_species / sum(n_species)) %>%
+  arrange(year, month, desc(n_species)) %>%
+  group_by(year, month) %>%
+  mutate(rank = rank(-n_species, ties.method = "first"),
+         cum_pct = cumsum(pct_species)) %>%
+  summarise(
+    n_to_50pct = min(rank[cum_pct >= 50]),
+    n_to_80pct = min(rank[cum_pct >= 80])
+  )
+
+# species by user and year
+ggplot(species_summary, aes(x = factor(year), y = n_to_80pct)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(
+    x = "Year",
+    y = "Recorders needed to reach 80% of species",
+    title = "Contributions to Species Diversity Over Time"
+  ) +
+  theme_minimal()
+
+# species by user and month (line)
+
+p1 <- ggplot(species_summary, aes(x = month, y = n_to_80pct)) +
+  geom_line(color = "steelblue", alpha = 0.5) +
+  geom_point(color = "darkblue", size = 1) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "3 months") +
+  labs(
+    x = "Month",
+    y = "Recorders needed to reach 80% of species",
+    title = "Monthly Contributions to Species Diversity Over Time"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p1
+
+#
+recorders_per_month <- inat_hull_sub %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(n_recorders = n_distinct(user_id))
+
+p2 <- ggplot(recorders_per_month, aes(x = month, y = n_recorders)) +
+  geom_line(color = "darkorange") +
+  geom_point(color = "red", size = 1) +
+  labs(
+    x = "Month",
+    y = "Number of active recorders",
+    title = "Monthly User Participation in Citizen Science"
+  ) +
+  theme_minimal()
+p2
+
+combined <- p1/p2
+combined
+
+# top 10 
+top10_summary <- records_summary %>%
+  group_by(year, month) %>%
+  mutate(rank = rank(-n_records, ties.method = "first"),
+         group = ifelse(rank <= 10, "Top 10", "Others")) %>%
+  group_by(year, month, group) %>%
+  summarise(pct_records = sum(pct_records), .groups = "drop")
+
+ggplot(top10_summary, aes(x = month, y = pct_records, color = group)) +
+  geom_line(size = 1.2) +
+  facet_wrap(~year, scales = "free_x") +
+  labs(x = "Month", y = "% of total records",
+       color = "Recorder group",
+       title = "Top 10 Recorders vs Others Over Time") +
+  theme_minimal()
+
+# top 5
+top5_summary <- records_summary %>%
+  group_by(year, month) %>%
+  mutate(rank = rank(-n_records, ties.method = "first"),
+         group = ifelse(rank <= 5, "Top 5", "Others")) %>%
+  group_by(year, month, group) %>%
+  summarise(pct_records = sum(pct_records), .groups = "drop")
+
+ggplot(top5_summary, aes(x = month, y = pct_records, color = group)) +
+  geom_line(size = 1.2) +
+  facet_wrap(~year, scales = "free_x") +
+  labs(x = "Month", y = "% of total records",
+       color = "Recorder group",
+       title = "Top 5 Recorders vs Others Over Time") +
+  theme_minimal()
+```
+
+```{r unique to cnc}
+# CNC observations
+cnc_observations <- anti_join(inat_hull_clean, inat_no_cnc, by = "id")
+
+# Create a CNC indicator in the full dataset
+inat_full <- inat_hull_clean %>%
+  mutate(is_cnc = id %in% cnc_observations$id)
+
+# Collapse subspecies to species (first two words), keep hybrids intact
+cnc_observations <- cnc_observations %>%
+  mutate(
+    scientific_name = if_else(
+      str_detect(scientific_name, "×"),
+      scientific_name,       # keep hybrids
+      word(scientific_name, 1, 2)  # species-level
+    )
+  )
+
+inat_no_cnc <- inat_no_cnc %>%
+  mutate(
+    scientific_name = if_else(
+      str_detect(scientific_name, "×"),
+      scientific_name,
+      word(scientific_name, 1, 2)
+    )
+  )
+
+# Get CNC-only species using corrected scientific names
+cnc_unique <- cnc_observations %>%
+  anti_join(inat_no_cnc, by = "scientific_name") %>%  # ensure true uniqueness
+  select(scientific_name, iconic_taxon_name, user_id, date, month) %>%
+  add_count(scientific_name, name = "obs_count") %>%
+  distinct(scientific_name, .keep_all = TRUE) %>%
+  arrange(desc(obs_count), iconic_taxon_name, scientific_name)
+
+cat("Total CNC-unique species:", nrow(cnc_unique), "\n")
+
+# Taxonomic breakdown 
+taxonomic_summary <- cnc_unique %>%
+  count(iconic_taxon_name, sort = TRUE) %>%
+  mutate(
+    percentage = round(n / sum(n) * 100, 1),
+    label = paste0(iconic_taxon_name, "\n(", n, " species, ", percentage, "%)")
+  )
+
+cat("Taxonomic breakdown of CNC-unique species:\n")
+print(taxonomic_summary)
+
+# Most observed CNC-unique species
+top_species <- cnc_unique %>%
+  slice_head(n = 20) %>%
+  mutate(display_name = scientific_name)
+
+cat("Top 20 most observed CNC-unique species:\n")
+print(top_species %>% select(display_name, iconic_taxon_name, obs_count))
+
+# Temporal distribution
+monthly_unique <- cnc_observations %>%
+  anti_join(inat_no_cnc, by = "scientific_name") %>%
+  count(month, iconic_taxon_name) %>%
+  complete(month, iconic_taxon_name, fill = list(n = 0))
+
+# Visualizations
+p1 <- ggplot(taxonomic_summary, aes(x = "", y = n, fill = iconic_taxon_name)) +
+  geom_col(width = 1) +
+  coord_polar("y", start = 0) +
+  labs(
+    title = "Taxonomic Groups of CNC-Unique Species",
+    subtitle = paste("Total:", sum(taxonomic_summary$n), "species"),
+    fill = "Taxonomic Group"
+  ) +
+  theme_void() +
+  theme(legend.position = "right")
+
+p2 <- ggplot(top_species, aes(x = fct_reorder(display_name, obs_count), y = obs_count, fill = iconic_taxon_name)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Most Frequently Observed CNC-Unique Species",
+    x = "Species",
+    y = "Number of CNC Observations",
+    fill = "Taxonomic Group"
+  ) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8))
+
+p3 <- ggplot(monthly_unique, aes(x = month, y = n, fill = iconic_taxon_name)) +
+  geom_col(position = "stack") +
+  labs(
+    title = "When CNC-Unique Species Were Discovered",
+    x = "Month",
+    y = "Number of Unique Species Observed",
+    fill = "Taxonomic Group"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Rarity analysis - single observation species
+single_obs_species <- cnc_unique %>%
+  filter(obs_count == 1) %>%
+  count(iconic_taxon_name, sort = TRUE)
+
+p4 <- ggplot(single_obs_species, aes(x = fct_reorder(iconic_taxon_name, n), y = n)) +
+  geom_col(fill = "coral", alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "CNC-Unique Species with Only 1 Observation",
+    subtitle = "Potential 'one-off' discoveries during CNC events",
+    x = "Taxonomic Group",
+    y = "Number of Single-Observation Species"
+  ) +
+  theme_minimal()
+
+# Print plots
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+
+# Complete species list by taxonomic group
+cat("\n=== COMPLETE BREAKDOWN BY TAXONOMIC GROUP ===\n")
+for(taxon in taxonomic_summary$iconic_taxon_name) {
+  cat("\n", paste(rep("=", 50), collapse=""), "\n")
+  cat(toupper(taxon), "(", sum(cnc_unique$iconic_taxon_name == taxon), "species )\n")
+  cat(paste(rep("=", 50), collapse=""), "\n")
+  
+  species_in_taxon <- cnc_unique %>%
+    filter(iconic_taxon_name == taxon) %>%
+    arrange(desc(obs_count), scientific_name) %>%
+    mutate(display = paste0(sprintf("%2d obs - ", obs_count), scientific_name)) %>%
+    pull(display)
+  
+  cat(paste(species_in_taxon, collapse = "\n"), "\n")
+}
+
+# Summary statistics
+cat("\n=== SUMMARY STATS ===\n")
+cat("Species with only 1 observation:", sum(cnc_unique$obs_count == 1), "\n")
+cat("Species with 2-5 observations:", sum(cnc_unique$obs_count %in% 2:5), "\n")
+cat("Species with 6+ observations:", sum(cnc_unique$obs_count >= 6), "\n")
+cat("Most observed unique species:", max(cnc_unique$obs_count), "observations\n")
+```
+```{r users per month}
+full_spatial <- inat_hull_sub  %>%
+filter(
+    year(observed_on) %in% 2023:2025)
+
+before_cnc <- inat_hull_sub %>%
+  filter(
+    year(observed_on) %in% 2020:2022)
+
+# Prepare average monthly users for CNC years
+full_spatial_summary <- full_spatial %>%
+  group_by(year = year(observed_on), month = month(observed_on, label = TRUE)) %>%
+  summarise(unique_users = n_distinct(user_id), .groups = "drop") %>%
+  group_by(month) %>%
+  summarise(mean_users = mean(unique_users), .groups = "drop") %>%
+  mutate(period = "CNC Years (2023-2025)")
+
+# Prepare average monthly users for pre-CNC years
+before_cnc_summary <- before_cnc %>%
+  group_by(year = year(observed_on), month = month(observed_on, label = TRUE)) %>%
+  summarise(unique_users = n_distinct(user_id), .groups = "drop") %>%
+  group_by(month) %>%
+  summarise(mean_users = mean(unique_users), .groups = "drop") %>%
+  mutate(period = "Pre-CNC (2020-2022)")
+
+# Combine
+plot_data <- bind_rows(full_spatial_summary, before_cnc_summary)
+
+# Plot with dodged bars
+ggplot(plot_data, aes(x = month, y = mean_users, fill = period)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c(
+    "CNC Years (2023-2025)" = "#74AC00",
+    "Pre-CNC (2020-2022)" = "steelblue"
+  )) +
+  labs(
+    title = "Average Monthly Unique iNaturalist Users",
+    x = "Month",
+    y = "Average Unique Users",
+    fill = "Period"
+  ) +
+  theme_minimal()
+```
+
+```{r filter records to cnc and non-cnc regardless of grade}
+inat_hull <- inat_hull %>%
+  mutate(
+    date = as.Date(observed_on),                  # YYYY-MM-DD
+    month = floor_date(date, "month")             # rounds down to first of month
+  )
+
+# Define CNC date ranges (Fri–Mon for CNC weekends)
+cnc_ranges <- list(
+  "2023" = as.Date(c("2023-04-28", "2023-05-01")),
+  "2024" = as.Date(c("2024-04-26", "2024-04-29")),
+  "2025" = as.Date(c("2025-04-25", "2025-04-28"))
+)
+
+# Create relative 7-day (Tue–Mon) week windows around CNC
+cnc_weeks <- map_dfr(names(cnc_ranges), function(y) {
+  range <- cnc_ranges[[y]]
+  # find the Tuesday before the CNC Friday (week 0 start)
+  cnc_tue <- floor_date(range[1], "week", week_start = 2)
+  tibble(
+    year = as.integer(y),
+    rel_week = -5:5,
+    week_start = cnc_tue + weeks(-5:5),
+    week_end = cnc_tue + weeks(-5:5) + days(6)
+  )
+})
+
+# Sanity checks
+# Check that all weeks start on Tuesday
+table(wday(cnc_weeks$week_start, label = TRUE))
+# Should return only "Tue"
+
+# Inspect CNC-relative weeks visually
+print(cnc_weeks)
+
+# Remove full CNC (week 0) window
+inat_no_cnc <- inat_hull %>%
+  filter(
+    !(date >= as.Date("2023-04-25") & date <= as.Date("2023-05-01")) &
+    !(date >= as.Date("2024-04-23") & date <= as.Date("2024-04-29")) &
+    !(date >= as.Date("2025-04-22") & date <= as.Date("2025-04-28"))
+  )
+
+cnc_observations <- inat_hull %>%
+  filter(
+    (date >= as.Date("2023-04-25") & date <= as.Date("2023-05-01")) |
+    (date >= as.Date("2024-04-23") & date <= as.Date("2024-04-29")) |
+    (date >= as.Date("2025-04-22") & date <= as.Date("2025-04-28"))
+  )
+
+# quick chec
+nrow(inat_hull) == nrow(inat_no_cnc) + nrow(cnc_observations)
+```
+
+```{r user activity in grid}
+# Create baseline (all non-CNC observations)
+baseline_sf <- inat_no_cnc %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 27700)
+
+# import grid
+grid_sf <- st_read("250m_grid_roi.shp")
+roi_landcover <- rast("ROI_1m_res.tif")
+grid_sf <- st_transform(grid_sf, crs(roi_landcover))
+grid_sf <- grid_sf %>% rename(grid_id = id)
+
+# Assign baseline points to grid cells
+baseline_join <- st_join(baseline_sf, grid_sf, join = st_within) %>%
+  mutate(date = as.Date(observed_on),
+         year = year(date))
+
+# Match baseline observations to relative weeks
+baseline_weeks <- baseline_join %>%
+  left_join(cnc_weeks, by = "year") %>%
+  filter(date >= week_start & date <= week_end) %>%
+  select(grid_id, user_id, year, rel_week)
+
+# Summarise unique users per grid per year per relative week
+baseline_summary <- baseline_weeks %>%
+  st_drop_geometry() %>%
+  group_by(grid_id, year, rel_week) %>%
+  summarise(unique_users = n_distinct(user_id), .groups = "drop")
+
+# Create CNC observations sf
+cnc_sf <- cnc_observations %>%       # <-- your CNC dataset
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 27700)
+#
+cnc_join <- st_join(cnc_sf, grid_sf, join = st_within) %>%
+  mutate(date = as.Date(observed_on),
+         year = year(date))
+
+cnc_weeks_join <- cnc_join %>%
+  left_join(cnc_weeks, by = "year") %>%
+  filter(date >= week_start & date <= week_end) %>%
+  select(grid_id, user_id, year, rel_week)
+
+cnc_summary <- cnc_weeks_join %>%
+  st_drop_geometry() %>%
+  group_by(grid_id, year, rel_week) %>%
+  summarise(cnc_users = n_distinct(user_id), .groups = "drop")
+
+# Merge baseline + CNC summaries
+grid_summary <- full_join(
+  baseline_summary, cnc_summary,
+  by = c("grid_id", "year", "rel_week")  # 👈 include year here
+) %>%
+  replace_na(list(unique_users = 0, cnc_users = 0)) %>%
+  mutate(
+    diff_users = cnc_users - unique_users,
+    ratio_users = ifelse(unique_users == 0, NA, cnc_users / unique_users)
+  )
+
+# Join summary back to grid geometry 
+grid_sf_out <- grid_sf %>%
+  left_join(grid_summary, by = "grid_id")
+
+# keep year for export
+st_write(grid_sf_out, "inat_users_250m_grid_7day_relative_weeks_yearly.shp",
+         delete_layer = TRUE)
+
+
+# sanity check on week alignment 
+# Verify CNC dates fall in rel_week == 0
+check_dates <- as.Date(c("2024-04-25", "2024-04-26", "2024-04-29", "2024-05-02"))
+check_dates %>%
+  tibble(date = .) %>%
+  mutate(year = year(date)) %>%
+  left_join(cnc_weeks, by = "year") %>%
+  filter(date >= week_start & date <= week_end) %>%
+  select(date, rel_week, week_start, week_end)
+
+# Grid per year
+table(baseline_summary$year)
+table(cnc_summary$year)
+length(unique(baseline_sf$user_id))
+length(unique(cnc_sf$user_id))
+```
+
+```{r roi raster analysis}
+# Extract land-cover proportions for ACTIVE + INACTIVE grids
+
+# Define the years you want to process
+years_to_process <- c(2023, 2024, 2025)
+
+# Load static layers (only once)
+grid_sf <- st_read("250m_grid_roi.shp") %>%
+  st_transform(crs = 27700) %>%
+  rename(grid_id = id)
+
+roi_landcover <- rast("ROI_1m_res.tif")
+
+# Prepare output list 
+roi_lc_all_years <- list()
+
+# Loop over years (active grids only)
+for (year_to_process in years_to_process) {
+  message("Processing year: ", year_to_process)
+
+  grid_summary_year <- grid_summary %>%
+    filter(year == year_to_process)
+
+  roi_effort <- st_transform(grid_sf, crs(roi_landcover))
+
+  roi_lc_extract <- exactextractr::exact_extract(
+    roi_landcover, roi_effort,
+    function(values, coverage_fraction) {
+      tapply(coverage_fraction, values, sum, na.rm = TRUE)
+    },
+    progress = TRUE
+  )
+
+  roi_lc_df <- bind_rows(lapply(seq_along(roi_lc_extract), function(i) {
+    if (is.null(roi_lc_extract[[i]])) return(NULL)
+    data.frame(
+      grid_id = roi_effort$grid_id[i],
+      class   = as.integer(names(roi_lc_extract[[i]])),
+      prop    = as.numeric(roi_lc_extract[[i]])
+    )
+  }))
+
+  roi_lc_df <- roi_lc_df %>%
+    inner_join(
+      st_drop_geometry(grid_summary_year) %>%
+        select(grid_id, year, unique_users, cnc_users),
+      by = "grid_id"
+    ) %>%
+    mutate(year = coalesce(year, year_to_process))
+
+  roi_lc_df <- roi_lc_df %>%
+    group_by(grid_id) %>%
+    mutate(prop = prop / sum(prop, na.rm = TRUE)) %>%
+    ungroup()
+
+  roi_lc_df_sum <- roi_lc_df %>%
+    group_by(grid_id, class, year) %>%
+    summarise(
+      prop = sum(prop, na.rm = TRUE),
+      unique_users = first(unique_users),
+      cnc_users = first(cnc_users),
+      .groups = "drop"
+    )
+
+  roi_lc_all_years[[as.character(year_to_process)]] <- roi_lc_df_sum
+
+  write.csv(roi_lc_df_sum, paste0("roi_lc_df_sum_", year_to_process, ".csv"), row.names = FALSE)
+}
+
+# Process INACTIVE grids
+
+message("Processing inactive grids...")
+
+inactive_sf <- st_read("grid_inactive.shp", quiet = TRUE) %>%
+  st_transform(crs = crs(roi_landcover))
+
+# Ensure numeric grid_id exists
+if (!"grid_id" %in% names(inactive_sf)) {
+  inactive_sf <- inactive_sf %>% mutate(grid_id = max(grid_sf$grid_id, na.rm = TRUE) + row_number())
+}
+
+# Extract landcover proportions for inactive grids
+inactive_extract <- exactextractr::exact_extract(
+  roi_landcover, inactive_sf,
+  function(values, coverage_fraction) {
+    tapply(coverage_fraction, values, sum, na.rm = TRUE)
+  },
+  progress = TRUE
+)
+
+inactive_lc <- bind_rows(lapply(seq_along(inactive_extract), function(i) {
+  if (is.null(inactive_extract[[i]])) return(NULL)
+  data.frame(
+    grid_id = inactive_sf$grid_id[i],
+    class   = as.integer(names(inactive_extract[[i]])),
+    prop    = as.numeric(inactive_extract[[i]])
+  )
+}))
+
+# Normalise proportions per grid
+inactive_lc <- inactive_lc %>%
+  group_by(grid_id) %>%
+  mutate(prop = prop / sum(prop, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(
+    year = NA_integer_,
+    unique_users = 0,
+    cnc_users = 0
+  )
+
+# Add to list as “Inactive”
+roi_lc_all_years[["Inactive"]] <- inactive_lc
+
+# Combine all years + inactive grids into one dataset
+roi_lc_all <- bind_rows(roi_lc_all_years, .id = "source")
+
+# Save combined dataset
+write.csv(roi_lc_all, "roi_lc_df_sum_all_years_including_inactive.csv", row.names = FALSE)
+
+# Quick sanity check
+table(roi_lc_all$source)
+# Should show 2023, 2024, 2025, Inactive
+```
+
+```{r}
+# LAND COVER COMPOSITION — BASELINE vs CNC
+# Across All Years (Weighted vs Unweighted)
+
+# Subset grids
+baseline_grid <- roi_lc_all %>% filter(unique_users >= 1)
+cnc_grid      <- roi_lc_all %>% filter(cnc_users >= 1)
+
+# Collapse across years 
+# Aggregate to grid × class (sum over years)
+baseline_collapsed <- baseline_grid %>%
+  group_by(grid_id, class) %>%
+  summarise(
+    prop = mean(prop, na.rm = TRUE),             # average land cover proportion
+    weight = sum(unique_users, na.rm = TRUE),    # total user effort across years
+    .groups = "drop"
+  )
+
+cnc_collapsed <- cnc_grid %>%
+  group_by(grid_id, class) %>%
+  summarise(
+    prop = mean(prop, na.rm = TRUE),
+    weight = sum(cnc_users, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Unweighted mean per class
+baseline_unweighted <- baseline_collapsed %>%
+  group_by(class) %>%
+  summarise(mean_prop = mean(prop, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "Baseline", type = "Unweighted")
+
+cnc_unweighted <- cnc_collapsed %>%
+  group_by(class) %>%
+  summarise(mean_prop = mean(prop, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "CNC", type = "Unweighted")
+
+# Weighted mean per class (by total user effort)
+baseline_weighted <- baseline_collapsed %>%
+  group_by(class) %>%
+  summarise(mean_prop = weighted.mean(prop, w = weight, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "Baseline", type = "Weighted")
+
+cnc_weighted <- cnc_collapsed %>%
+  group_by(class) %>%
+  summarise(mean_prop = weighted.mean(prop, w = weight, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dataset = "CNC", type = "Weighted")
+
+# Combine all summaries
+plot_df <- bind_rows(
+  baseline_unweighted,
+  cnc_unweighted,
+  baseline_weighted,
+  cnc_weighted
+)
+
+# Land cover class lookup
+lc_labels <- c(
+  "1"  = "allotment",
+  "2"  = "house",
+  "3"  = "cropland",
+  "4"  = "foreshore",
+  "5"  = "garden",
+  "6"  = "grass",
+  "7"  = "impervious",
+  "8"  = "reeds",
+  "9"  = "riparian",
+  "10" = "road",
+  "11" = "rough grass",
+  "12" = "saltmarsh",
+  "13" = "tidal water",
+  "14" = "trees",
+  "15" = "water"
+)
+
+plot_df <- plot_df %>%
+  mutate(class_name = dplyr::recode(as.character(class), !!!lc_labels))
+
+# Normalise within each dataset + type
+plot_df_norm <- plot_df %>%
+  group_by(dataset, type) %>%
+  mutate(mean_prop_norm = mean_prop / sum(mean_prop, na.rm = TRUE)) %>%
+  ungroup()
+
+# Plot Weighted vs Unweighted 
+ggplot(plot_df_norm, aes(x = class_name, y = mean_prop_norm, fill = dataset)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~type) +
+  labs(
+    title = "Land cover composition of grids used in CNC vs Baseline (All Years)",
+    subtitle = "Unweighted = unique grids; Weighted = grids weighted by total user activity across years",
+    x = "Land cover class",
+    y = "Proportion within dataset (sum = 1)",
+    fill = "Dataset"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+
+# Mean proportion per grid (unweighted)
+lc_mean_per_grid <- roi_lc_all %>%
+  group_by(dataset = if_else(cnc_users >= 1, "CNC", "Baseline"),
+           grid_id, class) %>%
+  summarise(mean_prop = mean(prop, na.rm = TRUE), .groups = "drop")
+
+mean_per_grid_summary <- lc_mean_per_grid %>%
+  group_by(dataset, class) %>%
+  summarise(mean_prop = mean(mean_prop, na.rm = TRUE), .groups = "drop") %>%
+  mutate(type = "Mean per Grid")
+
+#  Weighted mean by user effort (across years)
+lc_weighted_summary <- roi_lc_all %>%
+  group_by(dataset = if_else(cnc_users >= 1, "CNC", "Baseline"),
+           class) %>%
+  summarise(mean_prop = weighted.mean(prop, w = cnc_users + unique_users, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(type = "Weighted by Effort")
+
+ggplot(plot_df, aes(x = as.factor(class), y = mean_prop, fill = dataset)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~type) +
+  labs(
+    title = "Land cover composition of CNC vs Baseline grids",
+    subtitle = "Mean per grid vs Effort-weighted summaries",
+    x = "Land cover class",
+    y = "Mean proportion",
+    fill = "Dataset"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Combine for comparison
+plot_df <- bind_rows(mean_per_grid_summary, lc_weighted_summary)
+
+```
+
+```{r land cover diversity across active grids and time}
+# LAND COVER DIVERSITY (SHANNON INDEX)
+# Across Multiple Years (Baseline vs CNC)
+
+library(dplyr)
+library(tidyr)
+library(vegan)
+library(ggplot2)
+
+# Shannon Diversity (15-class) for Active vs Inactive
+# ============================================================
+
+library(tidyverse)
+library(vegan)
+
+# Subset grid squares per dataset
+baseline_grid <- roi_lc_all %>%
+  filter(unique_users >= 1)
+
+cnc_grid <- roi_lc_all %>%
+  filter(cnc_users >= 1)
+
+inactive_grid <- inactive_lc  # assuming same structure (grid_id, class, prop, year, etc.)
+
+# Pivot wider (grid_id × year = row; classes = columns)
+baseline_grid_wide <- baseline_grid %>%
+  pivot_wider(
+    id_cols     = c(grid_id, year),
+    names_from  = class,
+    values_from = prop,
+    values_fill = 0,
+    names_sort  = TRUE
+  ) %>%
+  mutate(total_prop = round(rowSums(across(-c(grid_id, year)), na.rm = TRUE), 2))
+
+cnc_grid_wide <- cnc_grid %>%
+  pivot_wider(
+    id_cols     = c(grid_id, year),
+    names_from  = class,
+    values_from = prop,
+    values_fill = 0,
+    names_sort  = TRUE
+  ) %>%
+  mutate(total_prop = round(rowSums(across(-c(grid_id, year)), na.rm = TRUE), 2))
+
+inactive_grid_wide <- inactive_grid %>%
+  pivot_wider(
+    id_cols     = c(grid_id, year),
+    names_from  = class,
+    values_from = prop,
+    values_fill = 0,
+    names_sort  = TRUE
+  ) %>%
+  mutate(total_prop = round(rowSums(across(-c(grid_id, year)), na.rm = TRUE), 2))
+
+#  Compute Shannon diversity per grid–year 
+baseline_grid_wide$shannon_index <- vegan::diversity(
+  baseline_grid_wide %>% select(-grid_id, -year, -total_prop) %>% replace(is.na(.), 0),
+  index = "shannon"
+)
+
+cnc_grid_wide$shannon_index <- vegan::diversity(
+  cnc_grid_wide %>% select(-grid_id, -year, -total_prop) %>% replace(is.na(.), 0),
+  index = "shannon"
+)
+
+inactive_grid_wide$shannon_index <- vegan::diversity(
+  inactive_grid_wide %>% select(-grid_id, -year, -total_prop) %>% replace(is.na(.), 0),
+  index = "shannon"
+)
+
+# Combine all datasets into one tidy dataframe
+plot_shannon <- bind_rows(
+  baseline_grid_wide %>%
+    select(grid_id, year, shannon_index) %>%
+    mutate(dataset = "Baseline"),
+  cnc_grid_wide %>%
+    select(grid_id, year, shannon_index) %>%
+    mutate(dataset = "CNC"),
+  inactive_grid_wide %>%
+    select(grid_id, year, shannon_index) %>%
+    mutate(dataset = "Inactive")
+)
+
+# Boxplot (no t-test, just visual) 
+ggplot(plot_shannon, aes(x = dataset, y = shannon_index, fill = dataset)) +
+  geom_boxplot(width = 0.6, alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.4, color = "black", size = 1) +
+  labs(
+    title = "Shannon Diversity Index (Land Cover per Grid-Year)",
+    subtitle = "Comparing Baseline, CNC, and Inactive grids",
+    x = "Dataset",
+    y = "Shannon Diversity Index"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold")
+  )
+
+#  Density plot for visual comparison
+ggplot(plot_shannon, aes(x = shannon_index, fill = dataset)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Distribution of Shannon Diversity (Land Cover) per Grid-Year",
+    subtitle = "Baseline vs CNC vs Inactive grids",
+    x = "Shannon Diversity Index",
+    y = "Density",
+    fill = "Dataset"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Save wide-format table for manual checking ----
+plot_shannon_wide <- plot_shannon %>%
+  pivot_wider(names_from = dataset, values_from = shannon_index)
+
+# View or write to CSV if needed
+head(plot_shannon_wide)
+# write_csv(plot_shannon_wide, "shannon_wide_check.csv")
+```
+
+```{r active grid comparison}
+# Collapse across all weeks/years
+grid_overlap <- grid_summary %>%
+  group_by(grid_id) %>%
+  summarise(
+    any_baseline = any(unique_users > 0, na.rm = TRUE),
+    any_cnc = any(cnc_users > 0, na.rm = TRUE),
+    both_active = any_baseline & any_cnc
+  )
+
+# remove aspect of time and just focus on grids
+grid_overlap %>%
+  summarise(
+    total_grids = n(),
+    both = sum(both_active),
+    baseline_only = sum(any_baseline & !any_cnc),
+    cnc_only = sum(any_cnc & !any_baseline)
+  )
+```
+
+```{r active grid comparison}
+# Collapse activity over all years/weeks to classify grids
+grid_overlap <- grid_summary %>%
+  group_by(grid_id) %>%
+  summarise(
+    any_baseline = any(unique_users > 0, na.rm = TRUE),
+    any_cnc      = any(cnc_users > 0, na.rm = TRUE),
+    both_active  = any_baseline & any_cnc,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    activity_type = case_when(
+      both_active ~ "Both-active",
+      any_baseline & !any_cnc ~ "Baseline-only",
+      any_cnc & !any_baseline ~ "CNC-only",
+      TRUE ~ "Inactive"
+    )
+  )
+
+# Collapse ROI land cover across all years
+roi_lc_all_collapsed <- roi_lc_all %>%
+  group_by(grid_id, class) %>%
+  summarise(prop = mean(prop, na.rm = TRUE), .groups = "drop")
+
+# Check that land-cover proportions sum to ~1 per grid
+prop_check <- roi_lc_all_collapsed %>%
+  group_by(grid_id) %>%
+  summarise(total_prop = sum(prop, na.rm = TRUE))
+
+summary(prop_check$total_prop)
+hist(prop_check$total_prop, main = "Distribution of total land-cover proportion per grid",
+     xlab = "Total proportion", col = "skyblue", border = "white")
+
+# flag potentially problematic grids (high deviation)
+bad_grids <- prop_check %>%
+  filter(total_prop < 0.95 | total_prop > 1.05)
+
+cat("Grids with total land-cover proportion outside 0.95–1.05 range:", nrow(bad_grids), "\n")
+
+# Join activity type back to ROI land-cover data
+roi_lc_all_joined <- roi_lc_all_collapsed %>%
+  left_join(select(grid_overlap, grid_id, activity_type), by = "grid_id")
+
+# Add inactive land-cover grids
+inactive_lc <- inactive_lc %>%
+  mutate(activity_type = "Inactive")
+
+roi_lc_all_joined <- bind_rows(roi_lc_all_joined, inactive_lc)
+
+# Land-cover class labels 
+lc_labels <- c(
+  "1"  = "allotment",
+  "2"  = "urban",
+  "3"  = "cropland",
+  "4"  = "foreshore",
+  "5"  = "garden",
+  "6"  = "grass",
+  "7"  = "impervious",
+  "8"  = "reeds",
+  "9"  = "riparian",
+  "10" = "road",
+  "11" = "rough grass",
+  "12" = "saltmarsh",
+  "13" = "tidal water",
+  "14" = "trees",
+  "15" = "water"
+)
+
+# Summarise and plot
+lc_summary_activity <- roi_lc_all_joined %>%
+  group_by(activity_type, class) %>%
+  summarise(mean_prop = mean(prop, na.rm = TRUE), .groups = "drop") %>%
+  mutate(class_name = dplyr::recode(as.character(class), !!!lc_labels))
+
+ggplot(lc_summary_activity, aes(x = class_name, y = mean_prop, fill = activity_type)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Mean Land-Cover Proportion per Grid",
+    subtitle = "Comparison across CNC-only, Baseline-only, and Both-active grids",
+    x = "Land-cover class",
+    y = "Mean proportion per grid square",
+    fill = "Activity Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r active grid comparison}
+#  Land-cover composition & heterogeneity by activity type
+library(dplyr)
+library(vegan)
+library(ggplot2)
+
+# Blue / Green / Grey composition & Shannon diversity
+
+
+# Prepare full grid_overlap table (with Inactive
+all_grids <- unique(roi_lc_all_joined$grid_id)
+
+# Patch grid_overlap so every grid_id has an activity_type
+grid_overlap_complete <- grid_overlap %>%
+  mutate(activity_type = ifelse(is.na(activity_type), "Inactive", activity_type))
+
+# Add any grids not in grid_overlap as 'Inactive'
+missing_inactive <- setdiff(all_grids, grid_overlap_complete$grid_id)
+
+grid_overlap_complete <- bind_rows(
+  grid_overlap_complete,
+  tibble(grid_id = missing_inactive, activity_type = "Inactive")
+)
+
+# Join activity_type cleanly
+roi_lc_all_joined <- roi_lc_all_joined %>%
+  select(-matches("activity_type")) %>%
+  left_join(
+    grid_overlap_complete %>% select(grid_id, activity_type),
+    by = "grid_id"
+  )
+
+#  Add inactive_lc (if it exists as separate object)
+if (exists("inactive_lc")) {
+  inactive_lc <- inactive_lc %>% mutate(activity_type = "Inactive")
+  roi_lc_all_joined <- bind_rows(roi_lc_all_joined, inactive_lc)
+}
+
+# Classify land-cover into Blue / Green / Grey
+roi_lc_bg <- roi_lc_all_joined %>%
+  mutate(
+    cover_group = case_when(
+      class %in% c(15, 13, 12, 9, 8, 4) ~ "Blue",   # tidal, water, foreshore, etc.
+      class %in% c(1, 3, 5, 6, 14, 11) ~ "Green",   # allotment, trees, grass, etc.
+      class %in% c(2, 7, 10) ~ "Grey",              # urban, impervious, road
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(cover_group)) %>%
+  group_by(grid_id, activity_type, cover_group) %>%
+  summarise(prop = sum(prop, na.rm = TRUE), .groups = "drop_last") %>%
+  tidyr::complete(cover_group, fill = list(prop = 0)) %>%
+  ungroup() %>%
+  group_by(grid_id) %>%
+  mutate(prop = prop / sum(prop, na.rm = TRUE)) %>%
+  ungroup()
+
+# Sanity checks
+## Proportions should sum ≈ 1 per grid
+check_norm <- roi_lc_bg %>%
+  group_by(grid_id) %>%
+  summarise(total_prop = sum(prop, na.rm = TRUE)) %>%
+  summarise(min = min(total_prop), mean = mean(total_prop), max = max(total_prop))
+print(check_norm)
+
+## Should have exactly 3 cover groups per grid
+roi_lc_bg %>%
+  group_by(grid_id) %>%
+  summarise(n_cover_types = n_distinct(cover_group)) %>%
+  count(n_cover_types)
+
+## Check grids per activity type
+roi_lc_bg %>%
+  distinct(grid_id, activity_type) %>%
+  count(activity_type, name = "unique_grids")
+
+# Compute Shannon diversity per grid
+# First, aggregate to one row per (grid_id, activity_type, class)
+roi_lc_for_div <- roi_lc_all_joined %>%
+  group_by(grid_id, activity_type, class) %>%
+  summarise(prop = sum(prop, na.rm = TRUE), .groups = "drop")
+
+# Normalise proportions within each grid
+roi_lc_div <- roi_lc_for_div %>%
+  group_by(grid_id, activity_type) %>%
+  mutate(prop = prop / sum(prop, na.rm = TRUE)) %>%
+  summarise(
+    shannon = vegan::diversity(prop, index = "shannon"),
+    .groups = "drop"
+  )
+
+# Summarise mean proportion per activity type & cover group
+roi_lc_bg_summary <- roi_lc_bg %>%
+  group_by(activity_type, cover_group) %>%
+  summarise(
+    mean_prop = mean(prop, na.rm = TRUE),
+    sd_prop   = sd(prop, na.rm = TRUE),
+    n_grids   = n_distinct(grid_id),
+    .groups   = "drop"
+  )
+
+# Plot mean Blue/Green/Grey proportions
+ggplot(roi_lc_bg_summary, aes(x = cover_group, y = mean_prop, fill = activity_type)) +
+  geom_col(position = "dodge", width = 0.7, color = "grey20") +
+  labs(
+    title = "Mean Proportion of Blue, Green, and Grey Space by Grid Activity Type",
+    subtitle = "Including CNC-only, Baseline-only, Both-active, and Inactive grids",
+    x = "Cover Type",
+    y = "Mean Proportion per Grid",
+    fill = "Activity Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(face = "bold"))
+
+# Diagnostic: each grid belongs to exactly one activity type
+roi_lc_bg %>%
+  count(grid_id, activity_type) %>%
+  count(grid_id) %>%
+  ggplot(aes(x = factor(n))) +
+  geom_bar(fill = "#3182bd") +
+  labs(
+    title = "Grid duplication check",
+    subtitle = "Each grid should appear in exactly one activity_type group",
+    x = "Number of activity types per grid",
+    y = "Count of grids"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r stacked bar}
+# Summarise proportions per activity type & cover group
+lc_composition <- roi_lc_bg %>%
+  group_by(activity_type, cover_group) %>%
+  summarise(mean_prop = mean(prop, na.rm = TRUE), .groups = "drop") %>%
+  group_by(activity_type) %>%
+  mutate(
+    total = sum(mean_prop, na.rm = TRUE),
+    rel_prop = mean_prop / total   # normalise within activity type
+  ) %>%
+  ungroup()
+
+# Plot stacked bar (each bar sums to 1 per activity type)
+ggplot(lc_composition, aes(
+  x = forcats::fct_relevel(activity_type, "CNC-only", "Baseline-only", "Both-active", "Inactive"),
+  y = rel_prop, fill = cover_group
+)) +
+  geom_col(width = 0.7, color = "white") +
+  scale_fill_manual(
+    values = c("Blue" = "#56B4E9", "Green" = "#009E73", "Grey" = "#999999"),
+    name = "Cover type"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Land-cover composition by activity type",
+    subtitle = "Proportion of Blue, Green, and Grey space per grid category",
+    x = "Activity type",
+    y = "Relative land-cover proportion"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+
+# checks!
+## Check each grid sums ≈ 1
+check_norm <- roi_lc_bg %>%
+  group_by(grid_id) %>%
+  summarise(total_prop = sum(prop, na.rm = TRUE))
+summary(check_norm$total_prop)
+
+# Each grid should have exactly 3 cover groups
+roi_lc_bg %>%
+  group_by(grid_id) %>%
+  summarise(n_cover_types = n_distinct(cover_group)) %>%
+  count(n_cover_types)
+
+## Within each activity type, check how often Blue/Green/Grey appear
+roi_lc_bg %>%
+  group_by(activity_type, cover_group) %>%
+  summarise(
+    prop_nonzero = mean(prop > 0),
+    mean_nonzero = mean(prop[prop > 0], na.rm = TRUE),
+    mean_all = mean(prop),
+    .groups = "drop"
+  )
+
+## Number of unique grids per activity type
+roi_lc_bg %>%
+  distinct(grid_id, activity_type) %>%
+  count(activity_type, name = "unique_grids")
+```
+
+```{r bootstrapped comparisons}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+
+set.seed(123)
+
+# Function for bootstrapping differences
+boot_diff <- function(data, group_col, value_col, g1, g2, n_boot = 1000) {
+  x1 <- data %>% filter(!!sym(group_col) == g1) %>% pull(!!sym(value_col))
+  x2 <- data %>% filter(!!sym(group_col) == g2) %>% pull(!!sym(value_col))
+  
+  n <- min(length(x1), length(x2))
+  diffs <- replicate(n_boot, {
+    mean(sample(x2, n, replace = TRUE)) - mean(sample(x1, n, replace = TRUE))
+  })
+  
+  tibble(
+    comparison  = paste(g2, "-", g1),
+    median_diff = median(diffs),
+    lower_CI    = quantile(diffs, 0.025),
+    upper_CI    = quantile(diffs, 0.975),
+    p_value     = mean(diffs < 0)
+  )
+}
+
+# BLUE SPACE
+blue_boot <- bind_rows(
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Blue"), "activity_type", "prop", "Baseline-only", "Both-active"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Blue"), "activity_type", "prop", "Baseline-only", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Blue"), "activity_type", "prop", "Both-active", "CNC-only")
+) %>%
+  mutate(metric = "Blue")
+
+# GREEN SPACE 
+green_boot <- bind_rows(
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Green"), "activity_type", "prop", "Baseline-only", "Both-active"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Green"), "activity_type", "prop", "Baseline-only", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Green"), "activity_type", "prop", "Both-active", "CNC-only")
+) %>%
+  mutate(metric = "Green")
+
+# GREY SPACE 
+grey_boot <- bind_rows(
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Grey"), "activity_type", "prop", "Baseline-only", "Both-active"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Grey"), "activity_type", "prop", "Baseline-only", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Grey"), "activity_type", "prop", "Both-active", "CNC-only")
+) %>%
+  mutate(metric = "Grey")
+
+# SHANNON DIVERSITY
+shannon_boot <- bind_rows(
+  boot_diff(roi_lc_div, "activity_type", "shannon", "Baseline-only", "Both-active"),
+  boot_diff(roi_lc_div, "activity_type", "shannon", "Baseline-only", "CNC-only"),
+  boot_diff(roi_lc_div, "activity_type", "shannon", "Both-active", "CNC-only")
+) %>%
+  mutate(metric = "Shannon")
+
+# Combine all results
+boot_results <- bind_rows(blue_boot, green_boot, grey_boot, shannon_boot)
+
+# View results
+boot_results %>%
+  mutate(across(where(is.numeric), round, 4)) %>%
+  print(n = Inf)
+
+# Plot 
+ggplot(boot_results, aes(x = comparison, y = median_diff, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.6) +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI),
+                width = 0.2,
+                position = position_dodge(width = 0.8)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(
+    title = "Bootstrapped mean differences between activity types",
+    subtitle = "Positive = higher value in second group",
+    y = "Mean difference (95% CI)",
+    x = "Comparison"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+boot_results %>%
+  group_by(metric) %>%
+  summarise(
+    avg_CI_width = mean(upper_CI - lower_CI),
+    median_diff_mean = mean(median_diff)
+  )
+
+boot_results %>%
+  mutate(CI_width = upper_CI - lower_CI,
+         rel_CI = CI_width / abs(median_diff)) %>%
+  group_by(metric) %>%
+  summarise(mean_rel_CI = mean(rel_CI, na.rm = TRUE))
+```
+
+```{r}
+boot_results <- boot_results %>%
+  mutate(sig = ifelse(lower_CI > 0 | upper_CI < 0, TRUE, FALSE))
+
+ggplot(boot_results, aes(x = comparison, y = median_diff, fill = metric, alpha = sig)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI),
+                width = 0.2,
+                position = position_dodge(width = 0.8)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~metric, scales = "free_y", nrow = 1) +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), guide = "none") +
+  scale_fill_manual(
+    values = c(
+      "Blue"    = "#56B4E9",
+      "Green"   = "#009E73",
+      "Grey"    = "#999999",
+      "Shannon" = "#E69F00"
+    )
+  ) +
+  labs(
+    title = "Bootstrapped differences in land-cover and heterogeneity metrics",
+    subtitle = "Bars shaded lighter if 95% CI overlaps zero (not significant)",
+    y = "Median difference (95% CI)",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r plot option}
+# Flag significance (CI does not cross zero)
+boot_results <- boot_results %>%
+  mutate(sig = if_else(lower_CI > 0 | upper_CI < 0, "Significant", "Not significant"))
+
+# Intuitive colour palette
+metric_cols <- c(
+  "Blue"    = "#1f78b4",
+  "Green"   = "#33a02c",
+  "Grey"    = "#7a7a7a",
+  "Shannon" = "#9b59b6"
+)
+
+ggplot(boot_results,
+       aes(x = comparison, y = median_diff,
+           color = metric)) +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI),
+                width = 0.15,
+                position = position_dodge(width = 0.6)) +
+  geom_point(aes(fill = if_else(sig == "Significant", metric, NA_character_)),
+             shape = 21,
+             size = 4,
+             stroke = 1.2,
+             position = position_dodge(width = 0.6),
+             color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~metric, scales = "free_y") +
+  scale_fill_manual(values = metric_cols, na.value = "white") +
+  scale_color_manual(values = metric_cols) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Bootstrapped mean differences between activity types",
+    subtitle = "Filled points = significant (95% CI excludes 0); empty circles = not significant",
+    y = "Mean difference (95% CI)",
+    x = "Comparison"
+  ) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)  # 🔹 rotation here
+  )
+```
+
+```{r}
+boot_results %>%
+  mutate(
+    sig = !(lower_CI < 0 & upper_CI > 0),
+    metric = factor(metric, levels = c("Blue", "Green", "Grey", "Shannon")),
+    comparison = factor(comparison, levels = rev(unique(comparison))),
+    
+    # Normalised fill scale for each metric
+    fill_color = case_when(
+      metric == "Blue"    ~ rescale(median_diff, to = c(0, 1)),
+      metric == "Green"   ~ rescale(median_diff, to = c(0, 1)),
+      metric == "Grey"    ~ rescale(median_diff, to = c(0, 1)),
+      metric == "Shannon" ~ rescale(median_diff, to = c(0, 1))
+    ),
+    
+    # Metric-specific color palettes
+    color_hex = case_when(
+  metric == "Blue"    ~ scales::gradient_n_pal(c("#deebf7", "#3182bd"))(rescale(median_diff, to = c(0, 1))),
+  metric == "Green"   ~ scales::gradient_n_pal(c("#e5f5e0", "#31a354"))(rescale(median_diff, to = c(0, 1))),
+  metric == "Grey"    ~ scales::gradient_n_pal(c("#f7f7f7", "#bdbdbd", "#252525"))(rescale(median_diff, from =       range(boot_results$median_diff, na.rm = TRUE))),
+  metric == "Shannon" ~ scales::gradient_n_pal(c("#fee6ce", "#e6550d"))(rescale(median_diff, to = c(0, 1)))
+)
+  ) %>%
+  ggplot(aes(x = metric, y = comparison, fill = color_hex, alpha = sig)) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = sprintf("%.2f\n[%.2f, %.2f]", median_diff, lower_CI, upper_CI)),
+    size = 3, color = "black", fontface = "bold", lineheight = 0.9
+  ) +
+  scale_fill_identity() +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), guide = "none") +
+  labs(
+    title = "Bootstrapped differences in land-cover and heterogeneity metrics",
+    subtitle = "Blue = Blue space, Green = Vegetation, Grey = Urban, Orange = Shannon diversity",
+    x = "Metric", y = "Comparison"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(face = "bold"),
+    axis.text.y = element_text(face = "bold"),
+    plot.title  = element_text(face = "bold")
+  )
+```
+
+```{r inactive vs active grids}
+roi_lc_bg_active_test <- roi_lc_bg %>%
+  mutate(activity_group = ifelse(activity_type == "Inactive", "Inactive", "Active"))
+
+roi_lc_div_active_test <- roi_lc_div %>%
+  mutate(activity_group = ifelse(activity_type == "Inactive", "Inactive", "Active"))
+
+set.seed(123)
+
+# BLUE SPACE
+blue_boot_AI <- boot_diff(
+  roi_lc_bg_active_test %>% filter(cover_group == "Blue"),
+  "activity_group", "prop",
+  "Active", "Inactive"
+) %>% mutate(metric = "Blue")
+
+# GREEN SPACE
+green_boot_AI <- boot_diff(
+  roi_lc_bg_active_test %>% filter(cover_group == "Green"),
+  "activity_group", "prop",
+  "Active", "Inactive"
+) %>% mutate(metric = "Green")
+
+# GREY SPACE 
+grey_boot_AI <- boot_diff(
+  roi_lc_bg_active_test %>% filter(cover_group == "Grey"),
+  "activity_group", "prop",
+  "Active", "Inactive"
+) %>% mutate(metric = "Grey")
+
+# SHANNON DIVERSITY
+shannon_boot_AI <- boot_diff(
+  roi_lc_div_active_test,
+  "activity_group", "shannon",
+  "Active", "Inactive"
+) %>% mutate(metric = "Shannon")
+
+# Combine all results
+boot_results_AI <- bind_rows(blue_boot_AI, green_boot_AI, grey_boot_AI, shannon_boot_AI)
+
+#
+boot_results_AI %>%
+  mutate(across(where(is.numeric), round, 4)) %>%
+  print(n = Inf)
+
+ggplot(boot_results_AI, aes(x = comparison, y = median_diff, fill = metric)) +
+  geom_col(width = 0.6, color = "grey30") +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(
+    title = "Bootstrapped mean differences: Active vs Inactive grids",
+    subtitle = "Positive = higher value in Inactive grids",
+    y = "Mean difference (95% CI)",
+    x = "Comparison"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r final boot strap}
+# BLUE SPACE
+blue_boot <- bind_rows(
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Blue"), "activity_type", "prop", "Baseline-only", "Both-active"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Blue"), "activity_type", "prop", "Baseline-only", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Blue"), "activity_type", "prop", "Both-active", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Blue"), "activity_type", "prop", "Inactive", "CNC-only")
+) %>%
+  mutate(metric = "Blue")
+
+# GREEN SPACE
+green_boot <- bind_rows(
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Green"), "activity_type", "prop", "Baseline-only", "Both-active"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Green"), "activity_type", "prop", "Baseline-only", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Green"), "activity_type", "prop", "Both-active", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Green"), "activity_type", "prop", "Inactive", "CNC-only")
+) %>%
+  mutate(metric = "Green")
+
+# GREY SPACE
+grey_boot <- bind_rows(
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Grey"), "activity_type", "prop", "Baseline-only", "Both-active"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Grey"), "activity_type", "prop", "Baseline-only", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Grey"), "activity_type", "prop", "Both-active", "CNC-only"),
+  boot_diff(roi_lc_bg %>% filter(cover_group == "Grey"), "activity_type", "prop", "Inactive", "CNC-only")
+) %>%
+  mutate(metric = "Grey")
+
+# SHANNON DIVERSITY
+shannon_boot <- bind_rows(
+  boot_diff(roi_lc_div, "activity_type", "shannon", "Baseline-only", "Both-active"),
+  boot_diff(roi_lc_div, "activity_type", "shannon", "Baseline-only", "CNC-only"),
+  boot_diff(roi_lc_div, "activity_type", "shannon", "Both-active", "CNC-only"),
+  boot_diff(roi_lc_div, "activity_type", "shannon", "Inactive", "CNC-only")
+) %>%
+  mutate(metric = "Shannon")
+
+##
+boot_results <- bind_rows(blue_boot, green_boot, grey_boot, shannon_boot) %>%
+  mutate(
+    comparison = factor(
+      comparison,
+      levels = c("CNC-only - Inactive",
+                 "CNC-only - Baseline-only",
+                 "CNC-only - Both-active",
+                 "Both-active - Baseline-only")
+    )
+  )
+
+## Final plot: vertical stacked panels with shared x-axis
+
+# Flag significance (CI does not cross zero)
+boot_results <- boot_results %>%
+  mutate(sig = if_else(lower_CI > 0 | upper_CI < 0, "Significant", "Not significant"))
+
+# colour palette
+metric_cols <- c(
+  "Blue"    = "#1f78b4",
+  "Green"   = "#33a02c",
+  "Grey"    = "#7a7a7a",
+  "Shannon" = "#9b59b6"
+)
+
+# Function for consistent metric panels
+plot_metric <- function(metric_name, show_x_labels = FALSE) {
+  ggplot(boot_results %>% filter(metric == metric_name),
+         aes(x = comparison, y = median_diff, color = metric)) +
+    geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI),
+                  width = 0.15) +
+    geom_point(aes(fill = if_else(sig == "Significant", metric, NA_character_)),
+               shape = 21, size = 4, stroke = 1.2, color = "black") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_fill_manual(values = metric_cols, na.value = "white") +
+    scale_color_manual(values = metric_cols) +
+    labs(y = metric_name,
+         x = if (show_x_labels) "Comparison" else NULL) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(
+        angle = 45, hjust = 1,
+        size = if (show_x_labels) 11 else 0,
+        color = if (show_x_labels) "black" else "transparent"
+      ),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_text(size = if (show_x_labels) 12 else 0),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+# Combine vertically with shared x-axis (bottom only labeled)
+p_blue    <- plot_metric("Blue",    show_x_labels = FALSE)
+p_green   <- plot_metric("Green",   show_x_labels = FALSE)
+p_grey    <- plot_metric("Grey",    show_x_labels = FALSE)
+p_shannon <- plot_metric("Shannon", show_x_labels = TRUE)
+
+combined_plot <- (p_blue / p_green / p_grey / p_shannon) +
+  plot_annotation(
+    title = "Bootstrapped mean differences between CNC and other grid types",
+    subtitle = "Filled points = significant (95% CI excludes 0); empty = not significant",
+    caption = "Comparisons: CNC-only vs Inactive, Baseline-only, Both-active, and Baseline vs Both-active"
+  )
+
+print(combined_plot)
+```
+
+```{r}
+️# Bootstrapped mean differences: Active vs Inactive
+
+set.seed(123)
+
+# Re-run bootstraps (flipped direction)
+blue_boot_AI <- boot_diff(
+  roi_lc_bg_active_test %>% filter(cover_group == "Blue"),
+  "activity_group", "prop",
+  "Inactive", "Active"
+) %>% mutate(metric = "Blue")
+
+green_boot_AI <- boot_diff(
+  roi_lc_bg_active_test %>% filter(cover_group == "Green"),
+  "activity_group", "prop",
+  "Inactive", "Active"
+) %>% mutate(metric = "Green")
+
+grey_boot_AI <- boot_diff(
+  roi_lc_bg_active_test %>% filter(cover_group == "Grey"),
+  "activity_group", "prop",
+  "Inactive", "Active"
+) %>% mutate(metric = "Grey")
+
+shannon_boot_AI <- boot_diff(
+  roi_lc_div_active_test,
+  "activity_group", "shannon",
+  "Inactive", "Active"
+) %>% mutate(metric = "Shannon")
+
+# Combine and flag significance
+boot_results_AI <- bind_rows(blue_boot_AI, green_boot_AI, grey_boot_AI, shannon_boot_AI) %>%
+  mutate(sig = if_else(lower_CI > 0 | upper_CI < 0, "Significant", "Not significant"))
+
+# Colour palette (consistent)
+metric_cols <- c(
+  "Blue"    = "#1f78b4",
+  "Green"   = "#33a02c",
+  "Grey"    = "#7a7a7a",
+  "Shannon" = "#9b59b6"
+)
+
+# Plot results
+ggplot(boot_results_AI,
+       aes(x = comparison, y = median_diff, color = metric)) +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI),
+                width = 0.15,
+                position = position_dodge(width = 0.6)) +
+  geom_point(aes(fill = if_else(sig == "Significant", metric, NA_character_)),
+             shape = 21,
+             size = 4,
+             stroke = 1.2,
+             position = position_dodge(width = 0.6),
+             color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~metric, scales = "free_y") +
+  scale_fill_manual(values = metric_cols, na.value = "white") +
+  scale_color_manual(values = metric_cols) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Bootstrapped mean differences: Active vs Inactive grids",
+    subtitle = "Filled points = significant (95% CI excludes 0); positive = higher in Active grids",
+    y = "Mean difference (95% CI)",
+    x = "Comparison"
+  ) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r three way comparison FINAL VERSION}
+# ️FINAL ANALYSIS:
+#   Simplified comparison of land-cover by:
+#     - Active (Baseline-only + Both-active)
+#     - CNC-only
+#     - Inactive
+#   Bootstrapped differences
+
+library(dplyr)
+library(ggplot2)
+library(purrr)
+
+# Recode activity groups
+#
+roi_lc_bg2 <- roi_lc_bg %>%
+  mutate(
+    activity_simple = case_when(
+      activity_type %in% c("Baseline-only", "Both-active") ~ "Active",
+      activity_type == "CNC-only"                          ~ "CNC-only",
+      activity_type == "Inactive"                          ~ "Inactive"
+    )
+  )
+
+roi_lc_div2 <- roi_lc_div %>%
+  mutate(
+    activity_simple = case_when(
+      activity_type %in% c("Baseline-only", "Both-active") ~ "Active",
+      activity_type == "CNC-only"                          ~ "CNC-only",
+      activity_type == "Inactive"                          ~ "Inactive"
+    )
+  )
+
+
+# Run bootstraps: CNC-only vs Active, CNC-only vs Inactive,
+#                    and Active vs Inactive
+
+set.seed(123)
+
+# BLUE 
+blue_new <- bind_rows(
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Blue"),
+            "activity_simple", "prop", "Active",  "CNC-only"),
+  
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Blue"),
+            "activity_simple", "prop", "Inactive","CNC-only"),
+  
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Blue"),
+            "activity_simple", "prop", "Inactive","Active")
+) %>% mutate(metric = "Blue")
+
+# GREEN 
+green_new <- bind_rows(
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Green"),
+            "activity_simple", "prop", "Active",  "CNC-only"),
+  
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Green"),
+            "activity_simple", "prop", "Inactive","CNC-only"),
+  
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Green"),
+            "activity_simple", "prop", "Inactive","Active")
+) %>% mutate(metric = "Green")
+
+# GREY 
+grey_new <- bind_rows(
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Grey"),
+            "activity_simple", "prop", "Active",  "CNC-only"),
+  
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Grey"),
+            "activity_simple", "prop", "Inactive","CNC-only"),
+  
+  boot_diff(roi_lc_bg2 %>% filter(cover_group == "Grey"),
+            "activity_simple", "prop", "Inactive","Active")
+) %>% mutate(metric = "Grey")
+
+# SHANNON 
+shannon_new <- bind_rows(
+  boot_diff(roi_lc_div2,
+            "activity_simple", "shannon", "Active",  "CNC-only"),
+  
+  boot_diff(roi_lc_div2,
+            "activity_simple", "shannon", "Inactive","CNC-only"),
+  
+  boot_diff(roi_lc_div2,
+            "activity_simple", "shannon", "Inactive","Active")
+) %>% mutate(metric = "Shannon")
+
+# Combine all metrics & flag significance
+
+boot_new <- bind_rows(blue_new, green_new, grey_new, shannon_new) %>%
+  mutate(sig = if_else(lower_CI > 0 | upper_CI < 0, "Significant", "Not significant"))
+
+# Clean factor order for readability
+boot_new$comparison <- factor(
+  boot_new$comparison,
+  levels = c(
+    "CNC-only - Active",
+    "CNC-only - Inactive",
+    "Active - Inactive"
+  )
+)
+
+# Colours
+metric_cols <- c(
+  "Blue"    = "#1f78b4",
+  "Green"   = "#33a02c",
+  "Grey"    = "#7a7a7a",
+  "Shannon" = "#9b59b6"
+)
+
+# Plot: stacked panels with shared x-axis
+#
+
+plot_metric_new <- function(metric_name, show_x_labels = FALSE) {
+  ggplot(boot_new %>% filter(metric == metric_name),
+         aes(x = comparison, y = median_diff, color = metric)) +
+    geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI),
+                  width = 0.15) +
+    geom_point(aes(fill = if_else(sig == "Significant", metric, NA_character_)),
+               shape = 21, size = 4, stroke = 1.2, color = "black") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_fill_manual(values = metric_cols, na.value = "white") +
+    scale_color_manual(values = metric_cols) +
+    labs(y = metric_name,
+         x = if (show_x_labels) "Comparison" else NULL) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(
+        angle = 45, hjust = 1,
+        size = if (show_x_labels) 11 else 0,
+        color = if (show_x_labels) "black" else "transparent"
+      ),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_text(size = if (show_x_labels) 12 else 0),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+p_blue_new    <- plot_metric_new("Blue",    show_x_labels = FALSE)
+p_green_new   <- plot_metric_new("Green",   show_x_labels = FALSE)
+p_grey_new    <- plot_metric_new("Grey",    show_x_labels = FALSE)
+p_shannon_new <- plot_metric_new("Shannon", show_x_labels = TRUE)
+
+combined_new <- (p_blue_new / p_green_new / p_grey_new / p_shannon_new) +
+  patchwork::plot_annotation(
+    title = "Simplified Land-Cover Differences: CNC-only vs Active vs Inactive",
+    subtitle = "Bootstrapped mean differences (95% CI). Filled points = significant.",
+    caption = "Active = Baseline-only + Both-active"
+  )
+
+print(combined_new)
+
+ggsave(
+  filename = "bootplot.png",
+  plot = combined_new,        # your ggplot object
+  width = 6,             # width
+  height = 8,            # height
+  units = "in",          # "in", "cm", or "mm"
+  dpi = 600              # resolution
+)
+
+# summary
+roi_lc_bg_summary_f <- roi_lc_bg %>%
+  mutate(
+    activity_simple = case_when(
+      activity_type %in% c("Baseline-only", "Both-active") ~ "Active",
+      activity_type == "CNC-only"                          ~ "CNC-only",
+      activity_type == "Inactive"                          ~ "Inactive",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  group_by(activity_simple, cover_group) %>%
+  summarise(
+    mean_prop = mean(prop, na.rm = TRUE),
+    sd_prop   = sd(prop, na.rm = TRUE),
+    .groups   = "drop"
+  )
+```
+
+```{r grid export}
+#  Export Baseline-only, CNC-only, and Both-active grids
+
+# Join the activity classification back to the grid geometry
+grid_sf_activity <- grid_sf %>%
+  left_join(grid_overlap, by = "grid_id")
+
+# Split into subsets
+grid_baseline <- grid_sf_activity %>% filter(activity_type == "Baseline-only")
+grid_cnc      <- grid_sf_activity %>% filter(activity_type == "CNC-only")
+grid_both     <- grid_sf_activity %>% filter(activity_type == "Both-active")
+
+# Optional: print counts
+cat("Baseline-only:", nrow(grid_baseline), "\n")
+cat("CNC-only:", nrow(grid_cnc), "\n")
+cat("Both-active:", nrow(grid_both), "\n")
+
+# Write to shapefiles
+st_write(grid_baseline, "grid_baseline_only.shp", delete_layer = TRUE)
+st_write(grid_cnc,      "grid_cnc_only.shp",      delete_layer = TRUE)
+st_write(grid_both,     "grid_both_active.shp",   delete_layer = TRUE)
+```
+
+```{r diversity models}
+#  Create spatial version of CNC observations
+cnc_obs_sf <- cnc_observations %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%       # WGS84
+  st_transform(st_crs(grid_sf))                                       # match grid CRS
+
+#  Spatial join: assign each observation to its grid cell
+cnc_obs_grid <- st_join(cnc_obs_sf, grid_sf["grid_id"], join = st_within)
+
+# Summarise diversity, users, and effort per grid
+cnc_grid_summary <- cnc_obs_grid %>%
+  st_drop_geometry() %>%
+  group_by(grid_id) %>%
+  summarise(
+    n_obs    = n(),                       # total observations
+    richness = n_distinct(taxon_id),      # unique taxa
+    n_users  = n_distinct(user_id),       # unique observers
+    .groups  = "drop"
+  )
+
+#  Join land-cover and Shannon diversity
+cnc_model_df <- cnc_grid_summary %>%
+  left_join(
+    roi_lc_bg %>%
+      dplyr::select(grid_id, cover_group, prop) %>%
+      tidyr::pivot_wider(
+        names_from = cover_group,
+        values_from = prop,
+        names_prefix = "prop_"
+      ),
+    by = "grid_id"
+  ) %>%
+  left_join(
+    roi_lc_div %>% dplyr::select(grid_id, shannon),
+    by = "grid_id"
+  )
+
+#
+cnc_model_df <- cnc_model_df %>%
+  mutate(
+    prop_Blue  = tidyr::replace_na(prop_Blue, 0),
+    prop_Green = tidyr::replace_na(prop_Green, 0),
+    prop_Grey  = tidyr::replace_na(prop_Grey, 0)
+  )
+```
+
+
+### CNC paper analysis stops here
+```{r diversity models}
+# check distribution
+par(mfrow=c(2,3))
+hist(cnc_model_df$richness)
+hist(cnc_model_df$n_obs)
+hist(cnc_model_df$n_users)
+hist(cnc_model_df$prop_Green)
+hist(cnc_model_df$prop_Blue)
+hist(cnc_model_df$prop_Grey)
+
+# check for variance inflation around variables
+library(car)
+vif(glm(richness ~ prop_Blue + prop_Green + shannon + n_users + n_obs, data = cnc_model_df, family = poisson))
+
+# Compute correlation matrix among predictors
+predictors <- cnc_model_df[, c("prop_Blue", "prop_Green", "shannon", "n_users", "n_obs")]
+cor_matrix <- cor(predictors, use = "complete.obs", method = "pearson")
+
+# Print correlation matrix
+print(cor_matrix)
+
+# (Optional) Visualize correlation matrix
+library(corrplot)
+corrplot(cor_matrix, method = "color", type = "upper", tl.col = "black", tl.srt = 45)
+# correlation matrix
+
+# Fit nt great
+glm_rich <- glm(
+  richness ~ prop_Blue + prop_Grey + shannon + log(n_obs),
+  data = cnc_model_df,
+  family = poisson(link = "log")
+)
+summary(glm_rich)
+par(mfrow=c(2,2))
+plot(glm_rich)
+
+# fit gam to deal with non-linear effect of observations
+gam_rich <- gam(
+  richness ~ prop_Blue + prop_Grey + shannon + s(n_obs),
+  data = cnc_model_df,
+  family = poisson
+)
+summary(gam_rich)
+plot(gam_rich)
+gam.check(gam_rich)
+
+# better with log
+gam_rich_log <- gam(
+  richness ~ prop_Blue + prop_Grey + shannon + s(log(n_obs)),
+  data = cnc_model_df,
+  family = poisson)
+
+summary(gam_rich_log)
+plot(gam_rich_log)
+gam.check(gam_rich_log)
+
+#
+deviance(gam_rich_log) / df.residual(gam_rich_log)
+
+# users not better are some only recorded a few
+gam_rich_users <- gam(
+  richness ~ prop_Blue + prop_Grey + shannon + s(n_users),
+  data = cnc_model_df,
+  family = poisson
+)
+summary(gam_rich_users)
+plot(gam_rich_users)
+gam.check(gam_rich_users)
+AIC(glm_rich, gam_rich, gam_rich_log, gam_rich_users, gam_rich_log_green)
+
+#
+gam_rich_log <- gam(
+  richness ~ prop_Blue + prop_Grey + shannon + s(log(n_obs)),
+  data = cnc_model_df,
+  family = poisson
+)
+summary(gam_rich_log)
+plot(gam_rich_log)
+gam.check(gam_rich_log)
+plot(gam_rich_log, all.terms = TRUE, pages = 1, shade = TRUE)
+
+# diag for final model
+par(mfrow=c(2,2))
+gam.check(gam_rich_log)
+
+# alt with green (no diff. between grey or green)
+gam_rich_log_green <- gam(
+  richness ~ prop_Blue + prop_Green + shannon + s(log(n_obs)),
+  data = cnc_model_df,
+  family = poisson
+)
+summary(gam_rich_log_green)
+plot(gam_rich_log_green)
+gam.check(gam_rich_log_green)
+plot(gam_rich_log_green, all.terms = TRUE, pages = 1, shade = TRUE)
+```
+
+```{r observations}
+glm_obs <- glm(
+  n_obs ~ prop_Blue + prop_Grey + shannon + n_users,
+  data = cnc_model_df,
+  family = poisson(link = "log")
+)
+summary(glm_obs)
+par(mfrow=c(2,2))
+plot(glm_obs)
+
+#
+glm_obs_q <- glm(
+  n_obs ~ prop_Blue + prop_Grey + shannon + n_users,
+  data = cnc_model_df,
+  family = quasipoisson(link = "log")
+)
+summary(glm_obs_q)
+
+#
+library(MASS)
+glm_obs_nb <- glm.nb(
+  n_obs ~ prop_Blue + prop_Grey + shannon + n_users,
+  data = cnc_model_df
+)
+summary(glm_obs_nb)
+
+AIC(glm_obs, glm_obs_q, glm_obs_nb)
+plot(glm_obs_nb) # grid 228, 163 and 360 outliers
+```
+
+```{r diversity models}
+# Preferred (keeps all attributes + CRS)
+# Example join: add richness, users, and activity type to grid_sf
+grid_export <- grid_sf %>%
+  left_join(cnc_model_df %>%
+              select(grid_id, richness, n_users, n_obs, prop_Blue, prop_Green, prop_Grey, shannon),
+            by = "grid_id") %>%
+  left_join(grid_overlap %>%
+              select(grid_id, activity_type),
+            by = "grid_id")
+
+st_write(grid_export, "grid_export.gpkg", layer = "grid", delete_dsn = TRUE)
+
+# Optional shapefile version (if you need .shp)
+st_write(grid_export, "grid_export.shp", delete_layer = TRUE)
+
+```
+
+```{r}
+# Users models
+glm_users_nat <- glm(n_users ~ prop_Blue + prop_Green + shannon,
+                     family = poisson(link = "log"), data = cnc_model_df)
+glm_users_grey <- glm(n_users ~ prop_Grey + shannon,
+                      family = poisson(link = "log"), data = cnc_model_df)
+
+# Richness models
+glm_rich_nat <- glm(richness ~ prop_Blue + prop_Green + shannon + log(n_obs),
+                    family = poisson(link = "log"), data = cnc_model_df)
+glm_rich_grey <- glm(richness ~ prop_Grey + shannon + log(n_obs),
+                     family = poisson(link = "log"), data = cnc_model_df)
+
+# Compare fits
+AIC(glm_users_nat, glm_users_grey, glm_rich_nat, glm_rich_grey)
+```
